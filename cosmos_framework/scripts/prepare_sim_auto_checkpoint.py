@@ -75,6 +75,10 @@ def main() -> None:
         object_store_credential_path_pretrained=None,
         device="cpu",
     )
+    # Validate public aliases before loading/saving multi-GB model weights.
+    # The local tokenizer loader must survive the same public-config round trip
+    # as every other constructor in the released checkpoint.
+    config.to_json_string()
     model = Cosmos3OmniModel.from_pretrained_dcp(source, config=config)
     state = get_model_state_dict(model.model)  # name -> parameter-shaped tensors
     for prefix in ("net.lidar2llm.", "net.llm2lidar.", "net.rig_view_embed."):

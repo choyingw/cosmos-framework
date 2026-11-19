@@ -24,6 +24,14 @@ def test_lidar_tokenizer_saved_target_round_trip() -> None:
     assert locate(restored["_target_"]) is LidarTokenizerV1Interface
 
 
+def test_local_training_tokenizer_target_round_trip() -> None:
+    target = "cosmos_framework.data.generator.local_simulation.dataset.load_bundle_tokenizer"
+    config = {"_target_": target, "directory": "/local/snapshot/text_tokenizer"}
+    public = build_public_model_config(config)
+    assert public == {"_target": "load_bundle_tokenizer", "directory": config["directory"]}
+    assert restore_model_config_from_public_model_config(public) == config
+
+
 def _has_key(obj, key: str) -> bool:
     if isinstance(obj, dict):
         return key in obj or any(_has_key(value, key) for value in obj.values())

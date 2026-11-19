@@ -33,6 +33,7 @@ _TARGET_ALIASES = {
     # through the existing 'projects.cosmos3.vfm.models.' prefix rule.
     "projects.cosmos3.vfm.models.omni_mot_causal_model.OmniMoTCausalModel": "omni_mot_causal_model",
     "projects.cosmos3.vfm.processors.build_processor_lazy": "build_processor_lazy",
+    "cosmos_framework.data.generator.local_simulation.dataset.load_bundle_tokenizer": "load_bundle_tokenizer",
     "cosmos_framework.model.generator.tokenizers.lidar.lidar_tokenizer_v1.LidarTokenizerV1Interface": "lidar_tokenizer_v1_interface",
     "cosmos_framework.model.generator.tokenizers.lidar.range_projection.LidarRangeProjectionConfig": "lidar_range_projection_config",
     "projects.cosmos3.vfm.tokenizers.audio.avae.AVAEInterface": "avae_interface",
