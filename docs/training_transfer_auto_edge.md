@@ -75,7 +75,6 @@ To repeat the **exact daytime source sequence** used when running
 ```bash
 python -m cosmos_framework.scripts.prepare_transfer_auto_edge_sample \
   --train-dummy --steps 10 \
-  --tokenizer "$TRANSFER_AUTO_HF/text_tokenizer" \
   --output /workspace/cosmos_data/edge_dummy_run01
 ```
 
@@ -84,8 +83,25 @@ its downloaded assets. It selects the first 61 frames from all seven recorded
 RGB views, clips the supplied captions to that interval, computes Canny controls
 online at 480x832, and repeatedly cycles that **one training sequence** for ten
 optimizer updates. It launches training directly; no request file, manual index,
-or `source train.env` step is needed. Model initialization still needs the DCP
-and VAE environment variables from the weight preparation above.
+or `source train.env` step is needed. No model/VAE environment variables are
+required for this command: the launcher resolves the released Transfer-Auto
+snapshot and tokenizer from Hugging Face, uses its bundled LiDAR VAE, and
+obtains the matched `Wan2.2_VAE.pth` from `Wan-AI/Wan2.2-TI2V-5B` if needed.
+Existing cached files are reused.
+
+The first launch converts the released pretrained weights to a CPU-created DCP,
+then validates and caches it under
+`$HF_HOME/cosmos_training/transfer_auto_init/` (the default Hugging Face home
+is used when `HF_HOME` is unset). Subsequent launches reuse that conversion.
+The cache identifies the source snapshot/config/weight files, and incomplete
+conversions are not published for reuse. All resolved paths are also saved in
+`train.env`. Missing gated-model access still requires your normal HF login.
+
+Existing `COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP`,
+`COSMOS_TRANSFER_AUTO_VIDEO_VAE`, `COSMOS_TRANSFER_AUTO_LIDAR_VAE`,
+`TRANSFER_AUTO_HF`, `LOCAL_QWEN_TOKENIZER` and `WAN_VAE_PATH` overrides remain
+supported. To select a local pretrained snapshot directly, use
+`--checkpoint /path/to/Cosmos3-Nano-Transfer-Auto`.
 
 GPU count defaults to all visible GPUs; use `--gpus N` to choose a count. The
 dummy run disables compilation, saves at its final update, and writes its

@@ -11,32 +11,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cosmos_framework.data.generator.local_simulation.transfer_auto_assets import (
+    validate_pretrained_initialization as validate_pretrained_initialization,
+)
 from cosmos_framework.data.generator.multiview.rig_catalog import MADS_AML_ALT_RIG
 
 SAMPLE_REPO = "nvidia/Cosmos3-Nano-Transfer-Auto"
-
-
-def validate_pretrained_initialization(directory: Path) -> Path:
-    """Refuse absent/incomplete regular weights before launching a dummy fine-tune."""
-    from torch.distributed.checkpoint import FileSystemReader
-
-    directory = directory.expanduser().absolute()
-    model = directory / "model"
-    if not (model / ".metadata").is_file():
-        raise FileNotFoundError(
-            f"Missing pretrained DCP: {model / '.metadata'}. Convert the released Transfer-Auto snapshot "
-            "with cosmos_framework.scripts.prepare_sim_auto_checkpoint first."
-        )
-    weights = FileSystemReader(model).read_metadata().state_dict_metadata
-    regular = [name for name in weights if name.startswith("net.")]
-    missing = [
-        group
-        for group in ("moe_gen", "time_embedder", "vae2llm", "llm2vae", "rig_view_embed")
-        if not any(group in name for name in regular)
-    ]
-    if missing:
-        raise ValueError(f"Pretrained DCP lacks regular model weights for: {', '.join(missing)}")
-    return directory
 
 
 def inference_sample_helpers():
@@ -156,6 +136,9 @@ def main() -> None:
     parser.add_argument("--sample-root", type=Path, help="sample_data, daytime_scene, or its download/snapshot root")
     parser.add_argument("--tokenizer", type=Path, help="Matching local text_tokenizer directory")
     parser.add_argument(
+        "--checkpoint", type=Path, help="Reuse a complete local pretrained snapshot; otherwise use HF cache"
+    )
+    parser.add_argument(
         "--output", type=Path, default=Path.home() / "cosmos_data/edge_daytime_sample", help="New preparation directory"
     )
     parser.add_argument(
@@ -172,45 +155,42 @@ def main() -> None:
     args = parser.parse_args()
     if args.steps < 1 or (args.gpus is not None and args.gpus < 1):
         parser.error("--steps and --gpus must be positive")
-    if args.train_dummy:
-        required = (
-            "COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP",
-            "COSMOS_TRANSFER_AUTO_VIDEO_VAE",
-            "COSMOS_TRANSFER_AUTO_LIDAR_VAE",
-        )
-        missing = [key for key in required if not os.environ.get(key)]
-        if missing:
-            parser.error("Set the model/VAE paths before training: " + ", ".join(missing))
-        try:
-            initialization = validate_pretrained_initialization(Path(os.environ[required[0]]))
-            for key in required[1:]:
-                if not Path(os.environ[key]).expanduser().is_file():
-                    raise FileNotFoundError(f"{key} does not point to a VAE weights file: {os.environ[key]}")
-        except (ValueError, FileNotFoundError) as error:
-            parser.error(str(error))
     try:
+        training_assets = {}
+        if args.train_dummy:
+            import torch
+
+            gpus = args.gpus if args.gpus is not None else torch.cuda.device_count()
+            if not 1 <= gpus <= torch.cuda.device_count():
+                parser.error(f"Requested {gpus} GPUs; this environment sees {torch.cuda.device_count()}")
+            if args.output.expanduser().exists():
+                parser.error(f"Use a fresh output directory: {args.output}")
+            from cosmos_framework.data.generator.local_simulation.transfer_auto_assets import resolve_training_assets
+
+            training_assets = resolve_training_assets(checkpoint=args.checkpoint, tokenizer=args.tokenizer)
         local_sample = args.sample_root or os.environ.get("AUTO_SAMPLE_ROOT")
         sample = inference_sample_helpers().fetch_sample(
             resolve_sample_root(Path(local_sample)) if local_sample else None
         )
-        tokenizer = args.tokenizer
+        tokenizer = training_assets.get("LOCAL_QWEN_TOKENIZER") or args.tokenizer
         if tokenizer is None and os.environ.get("TRANSFER_AUTO_HF"):
             tokenizer = Path(os.environ["TRANSFER_AUTO_HF"]) / "text_tokenizer"
         if tokenizer is None:
             # Standard HF download/cache layout: snapshot/assets/sample_data.
             tokenizer = sample.parent.parent / "text_tokenizer"
-        environment = prepare_sample(sample, tokenizer, args.output, captions=args.captions, hardlink=args.hardlink)
+        environment = prepare_sample(
+            sample, Path(tokenizer), args.output, captions=args.captions, hardlink=args.hardlink
+        )
+        if training_assets:
+            with environment.open("a") as handle:
+                handle.writelines(f"export {key}={shlex.quote(value)}\n" for key, value in training_assets.items())
     except (ValueError, FileNotFoundError) as error:
         parser.error(str(error))
     print(f"Downloaded sample: {sample}")
     print("Training: seven views, 61 frames per view, 480x832; online Canny controls")
     print(f"Load these training paths: source {shlex.quote(str(environment))}")
     if args.train_dummy:
-        import torch
-
-        gpus = args.gpus if args.gpus is not None else torch.cuda.device_count()
-        if not 1 <= gpus <= torch.cuda.device_count():
-            parser.error(f"Requested {gpus} GPUs; this environment sees {torch.cuda.device_count()}")
+        initialization = training_assets["COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP"]
         command = dummy_training_command(gpus=gpus, steps=args.steps)
         output = environment.parent
         (output / "command.txt").write_text(shlex.join(command) + "\n")
@@ -219,8 +199,8 @@ def main() -> None:
             COSMOS_TRAINING="1",
             COSMOS_INTERNAL="0",
             COSMOS_TRANSFER_AUTO_LOCAL_BUNDLE=str(output / "bundle"),
-            COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP=str(initialization),
             IMAGINAIRE_OUTPUT_ROOT=str(output / "training"),
+            **training_assets,
         )
         print(
             f"Pretrained initialization: {initialization} (strict regular-weight load; fresh optimizer/EMA)", flush=True

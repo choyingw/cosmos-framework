@@ -159,3 +159,38 @@ def test_pretrained_preflight_requires_real_dcp_and_all_adapted_modules(tmp_path
 def test_pretrained_preflight_accepts_covered_regular_weights(tmp_path):
     pretrained = _pretrained(tmp_path)
     assert setup.validate_pretrained_initialization(pretrained) == pretrained
+
+
+def test_dummy_without_model_env_uses_resolved_assets(tmp_path, monkeypatch):
+    root = _sample(tmp_path)
+    tokenizer = tmp_path / "tokenizer"
+    tokenizer.mkdir()
+    pretrained = _pretrained(tmp_path)
+    resolved = {
+        "COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP": str(pretrained),
+        "COSMOS_TRANSFER_AUTO_VIDEO_VAE": str(tmp_path / "video.pth"),
+        "COSMOS_TRANSFER_AUTO_LIDAR_VAE": str(tmp_path / "lidar.safetensors"),
+        "LOCAL_QWEN_TOKENIZER": str(tokenizer),
+    }
+    for key in (*resolved, "TRANSFER_AUTO_HF", "AUTO_SAMPLE_ROOT"):
+        monkeypatch.delenv(key, raising=False)
+    helpers = setup.inference_sample_helpers()
+    monkeypatch.setattr(
+        setup,
+        "inference_sample_helpers",
+        lambda: SimpleNamespace(fetch_sample=lambda source: root, caption_window=helpers.caption_window),
+    )
+    calls = []
+    monkeypatch.setattr(
+        "cosmos_framework.data.generator.local_simulation.transfer_auto_assets.resolve_training_assets",
+        lambda **kwargs: calls.append(kwargs) or resolved,
+    )
+    monkeypatch.setattr("torch.cuda.device_count", lambda: 1)
+    launched = []
+    monkeypatch.setattr(setup.subprocess, "run", lambda command, **kwargs: launched.append(kwargs))
+    output = tmp_path / "dummy"
+    monkeypatch.setattr(sys, "argv", ["setup", "--train-dummy", "--steps", "10", "--output", str(output)])
+    setup.main()
+    assert calls == [{"checkpoint": None, "tokenizer": None}]
+    assert all(launched[0]["env"][key] == value for key, value in resolved.items())
+    assert (output / "bundle/manifest.json").is_file()

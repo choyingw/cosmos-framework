@@ -19,6 +19,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-path", type=Path, required=True)
     parser.add_argument("--output-path", "-o", type=Path, required=True)
+    parser.add_argument("--video-vae", type=Path, help="Matching local Wan2.2 VAE; overrides snapshot storage paths")
     args = parser.parse_args()
     source = args.checkpoint_path.resolve()
     output = args.output_path.resolve()
@@ -28,6 +29,8 @@ def main() -> None:
             parser.error(f"Required snapshot file is missing: {path}")
     if output.exists():
         parser.error(f"Use a new output directory: {output}")
+    if args.video_vae is not None and not args.video_vae.expanduser().is_file():
+        parser.error(f"Video VAE is missing: {args.video_vae}")
 
     # Reuse the Framework HF loader; do not change attention or remap weights here.
     from cosmos_framework.inference.common.init import init_script
@@ -55,6 +58,17 @@ def main() -> None:
     model_config = config.model["config"]
     model_config["vlm_config"]["pretrained_weights"]["enabled"] = False
     model_config["diffusion_expert_config"]["load_weights_from_pretrained"] = False
+    if args.video_vae is not None:
+        model_config["tokenizer"].update(
+            vae_path=str(args.video_vae.expanduser().absolute()),
+            bucket_name="",
+            object_store_credential_path_pretrained="",
+        )
+    if (source / "text_tokenizer").is_dir():
+        model_config["vlm_config"]["tokenizer"] = dict(
+            _target_="cosmos_framework.data.generator.local_simulation.dataset.load_bundle_tokenizer",
+            directory=str(source / "text_tokenizer"),
+        )
     model_config["lidar_tokenizer"].update(
         vae_path=str(lidar_vae),
         bucket_name="",
