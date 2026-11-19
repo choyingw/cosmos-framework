@@ -103,7 +103,6 @@ def prepare_sample(sample_root: Path, tokenizer: Path, output: Path, *, captions
 
 def dummy_training_command(*, gpus: int, steps: int) -> list[str]:
     """Repeat the one-sequence bundle through the native infinite training loader."""
-    repo = Path(__file__).resolve().parents[2]
     return [
         sys.executable,
         "-m",
@@ -113,7 +112,9 @@ def dummy_training_command(*, gpus: int, steps: int) -> list[str]:
         "--module",
         "cosmos_framework.scripts.train_experiment",
         "--config",
-        str(repo / "cosmos_framework/configs/simulation/config.py"),
+        # get_config_module expects a path relative to the repository root;
+        # the subprocess below already runs with that root as its cwd.
+        "cosmos_framework/configs/simulation/config.py",
         "--experiment-module",
         "cosmos_framework.configs.simulation.experiment.auto.transfer_auto_edge",
         "--",

@@ -161,6 +161,14 @@ def test_pretrained_preflight_accepts_covered_regular_weights(tmp_path):
     assert setup.validate_pretrained_initialization(pretrained) == pretrained
 
 
+def test_generated_dummy_command_resolves_through_the_native_config_loader():
+    from cosmos_framework.utils.config_helper import get_config_module
+
+    command = setup.dummy_training_command(gpus=8, steps=10)
+    config = command[command.index("--config") + 1]
+    assert get_config_module(config) == "cosmos_framework.configs.simulation.config"
+
+
 def test_dummy_without_model_env_uses_resolved_assets(tmp_path, monkeypatch):
     root = _sample(tmp_path)
     tokenizer = tmp_path / "tokenizer"
