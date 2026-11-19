@@ -21,8 +21,6 @@ from dataclasses import dataclass
 
 import torch
 
-from cosmos_framework.model.attention import attention, multi_dimensional_attention
-from cosmos_framework.model.attention import merge_attentions as _native_merge_attentions
 from cosmos_framework.configs.base.defaults.multiview_attention import (
     CAPTION_SCOPE_ALL,
     CAPTION_SCOPE_NONE,
@@ -35,6 +33,14 @@ from cosmos_framework.configs.base.defaults.multiview_attention import (
     resolve_caption_scope,
     temporal_window_bounds,
 )
+from cosmos_framework.data.generator.sequence_packing.runtime import (
+    SequencePack,
+    get_causal_seq,
+    get_full_only_seq,
+    get_num_real_samples,
+)
+from cosmos_framework.model.attention import attention, multi_dimensional_attention
+from cosmos_framework.model.attention import merge_attentions as _native_merge_attentions
 from cosmos_framework.model.generator.mot.activation_marks import mark_next_activation
 from cosmos_framework.model.generator.mot.camera_relative_pose import (
     CameraPosePartition,
@@ -44,7 +50,6 @@ from cosmos_framework.model.generator.mot.camera_relative_pose import (
     apply_prope_pairs,
     prope_pair_channels,
 )
-
 from cosmos_framework.model.generator.mot.merge_attention import merge_attentions_ac_safe
 from cosmos_framework.model.generator.mot.merge_bridge import (
     BridgeFn,
@@ -52,12 +57,7 @@ from cosmos_framework.model.generator.mot.merge_bridge import (
     MergeAttentionsBridge,
 )
 from cosmos_framework.model.generator.mot.rigrope import apply_mrope_rotary, apply_rig_rotary
-from cosmos_framework.data.generator.sequence_packing.runtime import (
-    SequencePack,
-    get_causal_seq,
-    get_full_only_seq,
-    get_num_real_samples,
-)
+from cosmos_framework.utils.step_timing import attention_region
 
 # The scopes these folds express as disjoint attention rectangles, and so can run without a
 # mask. ``"same_view"`` is one partition; ``"decomposed"`` also partitions cross-view edges,
@@ -1877,232 +1877,237 @@ def multiview_maskless_gen_attention(
     # axis leaves a view's tokens already contiguous: the groups tile the stream in packed order
     # and the kernel's own output is that order -- no gather, no bridge. A control item puts a
     # view's tokens in two runs instead, which costs the gather and the bridge back.
-    if plan.neighborhood_layout is not None:
-        if plan.sensor_gather is None:
-            raise ValueError("A windowed multiview attention plan is missing its sensor neighborhood geometry.")
-        layout = plan.neighborhood_layout
-        # Each role participates in multiple edges. Share its gathered inputs while keeping
-        # every kernel's output/LSE bridge independent for the attention merges' backward.
-        sensor_q = q[plan.sensor_gather].reshape(-1, *layout, q.shape[-2], q.shape[-1])  # [B,F,Y,X,H,D]
-        sensor_k = k[plan.sensor_gather].reshape(-1, *layout, k.shape[-2], k.shape[-1])  # [B,F,Y,X,Hkv,D]
-        sensor_v = v[plan.sensor_gather].reshape(-1, *layout, v.shape[-2], v.shape[-1])  # [B,F,Y,X,Hkv,D]
-        sensor_to_sensor_out, sensor_to_sensor_lse = _same_view_neighborhood_attention(
-            sensor_q,
-            sensor_k,
-            sensor_v,
-            window=plan.sensor_to_sensor_window,
-        )  # [1,N_sensor,H,D], [1,N_sensor,H]
-        if plan.control_gather is None:
-            # Sensor is the only query population. The bridge still matters when the pack has
-            # padding: it fills those rows with zero merge weight and preserves the attention
-            # kernel's saved output/LSE storage during the outer log-sum-exp merge's backward.
-            same_view_out, same_view_lse = MergeAttentionsBridge.apply(
-                sensor_to_sensor_out,
-                sensor_to_sensor_lse,
-                _scatter_to_packed(plan.sensor_gather, num_gen_tokens),
-                _gather_from_packed(plan.sensor_gather),
-            )  # [1,N_gen,H,D], [1,N_gen,H]
-        else:
-            control_q = q[plan.control_gather].reshape(-1, *layout, q.shape[-2], q.shape[-1])  # [B,F,Y,X,H,D]
-            control_k = k[plan.control_gather].reshape(-1, *layout, k.shape[-2], k.shape[-1])  # [B,F,Y,X,Hkv,D]
-            control_v = v[plan.control_gather].reshape(-1, *layout, v.shape[-2], v.shape[-1])  # [B,F,Y,X,Hkv,D]
-            sensor_to_control_out, sensor_to_control_lse = _same_view_neighborhood_attention(
+    with attention_region("same_view"):
+        if plan.neighborhood_layout is not None:
+            if plan.sensor_gather is None:
+                raise ValueError("A windowed multiview attention plan is missing its sensor neighborhood geometry.")
+            layout = plan.neighborhood_layout
+            # Each role participates in multiple edges. Share its gathered inputs while keeping
+            # every kernel's output/LSE bridge independent for the attention merges' backward.
+            sensor_q = q[plan.sensor_gather].reshape(-1, *layout, q.shape[-2], q.shape[-1])  # [B,F,Y,X,H,D]
+            sensor_k = k[plan.sensor_gather].reshape(-1, *layout, k.shape[-2], k.shape[-1])  # [B,F,Y,X,Hkv,D]
+            sensor_v = v[plan.sensor_gather].reshape(-1, *layout, v.shape[-2], v.shape[-1])  # [B,F,Y,X,Hkv,D]
+            sensor_to_sensor_out, sensor_to_sensor_lse = _same_view_neighborhood_attention(
                 sensor_q,
-                control_k,
-                control_v,
-                window=plan.sensor_to_control_window,
+                sensor_k,
+                sensor_v,
+                window=plan.sensor_to_sensor_window,
             )  # [1,N_sensor,H,D], [1,N_sensor,H]
-            sensor_out, sensor_lse = merge_attentions(
-                outputs=[sensor_to_sensor_out, sensor_to_control_out],
-                lse_tensors=[sensor_to_sensor_lse, sensor_to_control_lse],
-                torch_compile=True,
-            )  # [1,N_sensor,H,D], [1,N_sensor,H]
-            control_to_control_out, control_to_control_lse = _same_view_neighborhood_attention(
-                control_q,
-                control_k,
-                control_v,
-                window=plan.control_to_control_window,
-            )  # [1,N_control,H,D], [1,N_control,H]
-            # Windowing narrows enabled edges; it must not restore the sensor keys
-            # withheld from control queries by control_attends_sensor=False.
-            control_out, control_lse = (
-                control_to_control_out,
-                control_to_control_lse,
-            )  # [1,N_control,H,D], [1,N_control,H]
-            if plan.control_attends_sensor:
-                control_to_sensor_out, control_to_sensor_lse = _same_view_neighborhood_attention(
-                    control_q,
-                    sensor_k,
-                    sensor_v,
-                    window=plan.control_to_sensor_window,
-                )  # [1,N_control,H,D], [1,N_control,H]
-                control_out, control_lse = merge_attentions(
-                    outputs=[control_to_sensor_out, control_to_control_out],
-                    lse_tensors=[control_to_sensor_lse, control_to_control_lse],
+            if plan.control_gather is None:
+                # Sensor is the only query population. The bridge still matters when the pack has
+                # padding: it fills those rows with zero merge weight and preserves the attention
+                # kernel's saved output/LSE storage during the outer log-sum-exp merge's backward.
+                same_view_out, same_view_lse = MergeAttentionsBridge.apply(
+                    sensor_to_sensor_out,
+                    sensor_to_sensor_lse,
+                    _scatter_to_packed(plan.sensor_gather, num_gen_tokens),
+                    _gather_from_packed(plan.sensor_gather),
+                )  # [1,N_gen,H,D], [1,N_gen,H]
+            else:
+                control_q = q[plan.control_gather].reshape(-1, *layout, q.shape[-2], q.shape[-1])  # [B,F,Y,X,H,D]
+                control_k = k[plan.control_gather].reshape(-1, *layout, k.shape[-2], k.shape[-1])  # [B,F,Y,X,Hkv,D]
+                control_v = v[plan.control_gather].reshape(-1, *layout, v.shape[-2], v.shape[-1])  # [B,F,Y,X,Hkv,D]
+                sensor_to_control_out, sensor_to_control_lse = _same_view_neighborhood_attention(
+                    sensor_q,
+                    control_k,
+                    control_v,
+                    window=plan.sensor_to_control_window,
+                )  # [1,N_sensor,H,D], [1,N_sensor,H]
+                sensor_out, sensor_lse = merge_attentions(
+                    outputs=[sensor_to_sensor_out, sensor_to_control_out],
+                    lse_tensors=[sensor_to_sensor_lse, sensor_to_control_lse],
                     torch_compile=True,
+                )  # [1,N_sensor,H,D], [1,N_sensor,H]
+                control_to_control_out, control_to_control_lse = _same_view_neighborhood_attention(
+                    control_q,
+                    control_k,
+                    control_v,
+                    window=plan.control_to_control_window,
                 )  # [1,N_control,H,D], [1,N_control,H]
-            same_view_out, same_view_lse = DisjointQueriesBridge.apply(
-                sensor_out,
-                sensor_lse,
-                control_out,
-                control_lse,
-                plan.sensor_gather,
-                plan.control_gather,
-                num_gen_tokens,
-            )  # [1,N_gen,H,D], [1,N_gen,H]
-    else:
-        #
-        # Under ``control_attends_sensor=False`` a group is no longer one segment: its sensor queries
-        # take it whole while its control queries take its control tokens alone, so the plan cuts it
-        # into two varlen segments with their own keys. Still one pass and one kernel -- varlen pairs
-        # segment ``i`` of the queries with segment ``i`` of the keys, and nothing requires the two
-        # to be the same length or even the same tokens. Both sides are then a gather, the identity
-        # form belonging to the unsplit case alone.
-        if plan.same_view_q_gather is None:
-            view_gather = kv_gather = plan.same_view_gather
-            q_offsets, kv_offsets = plan.same_view_offsets, plan.same_view_offsets
-            q_max_len, kv_max_len = plan.same_view_max_len, plan.same_view_max_len
+                # Windowing narrows enabled edges; it must not restore the sensor keys
+                # withheld from control queries by control_attends_sensor=False.
+                control_out, control_lse = (
+                    control_to_control_out,
+                    control_to_control_lse,
+                )  # [1,N_control,H,D], [1,N_control,H]
+                if plan.control_attends_sensor:
+                    control_to_sensor_out, control_to_sensor_lse = _same_view_neighborhood_attention(
+                        control_q,
+                        sensor_k,
+                        sensor_v,
+                        window=plan.control_to_sensor_window,
+                    )  # [1,N_control,H,D], [1,N_control,H]
+                    control_out, control_lse = merge_attentions(
+                        outputs=[control_to_sensor_out, control_to_control_out],
+                        lse_tensors=[control_to_sensor_lse, control_to_control_lse],
+                        torch_compile=True,
+                    )  # [1,N_control,H,D], [1,N_control,H]
+                same_view_out, same_view_lse = DisjointQueriesBridge.apply(
+                    sensor_out,
+                    sensor_lse,
+                    control_out,
+                    control_lse,
+                    plan.sensor_gather,
+                    plan.control_gather,
+                    num_gen_tokens,
+                )  # [1,N_gen,H,D], [1,N_gen,H]
         else:
-            view_gather, kv_gather = plan.same_view_q_gather, plan.same_view_kv_gather
-            q_offsets, kv_offsets = plan.same_view_q_offsets, plan.same_view_kv_offsets
-            q_max_len, kv_max_len = plan.same_view_q_max_len, plan.same_view_kv_max_len
-        # Keep this fold's output under selective AC rather than recomputing it: it is
-        # ~96% of forward attention time and ~94% of backward, against three other
-        # calls running the same kernel that a name-matching policy cannot tell apart.
-        # The mark goes on K because it is the smallest operand the call takes -- 32 query
-        # heads against 8 KV heads, 2 against 1 per rank under CP16 -- and marking copies
-        # what it marks. The split leaves this a single call, so the mark still covers all of it.
-        same_view_k = mark_next_activation((k if kv_gather is None else k[kv_gather]).unsqueeze(0))
-        same_view_out, same_view_lse = attention(
-            (q if view_gather is None else q[view_gather]).unsqueeze(0),  # [1,N_q,heads,head_dim]
-            same_view_k,  # [1,N_kv,kv_heads,head_dim]
-            (v if kv_gather is None else v[kv_gather]).unsqueeze(0),  # [1,N_kv,kv_heads,head_dim]
-            cumulative_seqlen_Q=q_offsets,
-            cumulative_seqlen_KV=kv_offsets,
-            max_seqlen_Q=q_max_len,
-            max_seqlen_KV=kv_max_len,
-            return_lse=True,
-        )  # out: [1,N_q,heads,head_dim], lse: [1,N_q,heads]
-        if view_gather is not None:
-            # By the query gather, which is what indexes this pass's *output* rows; the key gather is
-            # internal to the kernel's own sum and has nothing on the far side to be put back into.
-            same_view_out, same_view_lse = MergeAttentionsBridge.apply(
-                same_view_out,
-                same_view_lse,
-                _scatter_to_packed(view_gather, num_gen_tokens),
-                _gather_from_packed(view_gather),
-            )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
+            #
+            # Under ``control_attends_sensor=False`` a group is no longer one segment: its sensor queries
+            # take it whole while its control queries take its control tokens alone, so the plan cuts it
+            # into two varlen segments with their own keys. Still one pass and one kernel -- varlen pairs
+            # segment ``i`` of the queries with segment ``i`` of the keys, and nothing requires the two
+            # to be the same length or even the same tokens. Both sides are then a gather, the identity
+            # form belonging to the unsplit case alone.
+            if plan.same_view_q_gather is None:
+                view_gather = kv_gather = plan.same_view_gather
+                q_offsets, kv_offsets = plan.same_view_offsets, plan.same_view_offsets
+                q_max_len, kv_max_len = plan.same_view_max_len, plan.same_view_max_len
+            else:
+                view_gather, kv_gather = plan.same_view_q_gather, plan.same_view_kv_gather
+                q_offsets, kv_offsets = plan.same_view_q_offsets, plan.same_view_kv_offsets
+                q_max_len, kv_max_len = plan.same_view_q_max_len, plan.same_view_kv_max_len
+            # Keep this fold's output under selective AC rather than recomputing it: it is
+            # ~96% of forward attention time and ~94% of backward, against three other
+            # calls running the same kernel that a name-matching policy cannot tell apart.
+            # The mark goes on K because it is the smallest operand the call takes -- 32 query
+            # heads against 8 KV heads, 2 against 1 per rank under CP16 -- and marking copies
+            # what it marks. The split leaves this a single call, so the mark still covers all of it.
+            same_view_k = mark_next_activation((k if kv_gather is None else k[kv_gather]).unsqueeze(0))
+            same_view_out, same_view_lse = attention(
+                (q if view_gather is None else q[view_gather]).unsqueeze(0),  # [1,N_q,heads,head_dim]
+                same_view_k,  # [1,N_kv,kv_heads,head_dim]
+                (v if kv_gather is None else v[kv_gather]).unsqueeze(0),  # [1,N_kv,kv_heads,head_dim]
+                cumulative_seqlen_Q=q_offsets,
+                cumulative_seqlen_KV=kv_offsets,
+                max_seqlen_Q=q_max_len,
+                max_seqlen_KV=kv_max_len,
+                return_lse=True,
+            )  # out: [1,N_q,heads,head_dim], lse: [1,N_q,heads]
+            if view_gather is not None:
+                # By the query gather, which is what indexes this pass's *output* rows; the key gather is
+                # internal to the kernel's own sum and has nothing on the far side to be put back into.
+                same_view_out, same_view_lse = MergeAttentionsBridge.apply(
+                    same_view_out,
+                    same_view_lse,
+                    _scatter_to_packed(view_gather, num_gen_tokens),
+                    _gather_from_packed(view_gather),
+                )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
 
     # A batch whose every sample owns one view group has no cross-instant work to do: its
     # instant groups sit inside its view groups, so the pass would only double-weight each
     # query's own instant. Skipped outright rather than merged at zero weight, which saves
     # the kernel as well as the distortion.
     # One branch per cross-view pass; ``"other_views"`` band keys run one per view-tree level.
-    cross_view_outs: list[torch.Tensor] = []
-    cross_view_lses: list[torch.Tensor] = []
-    if plan.camera_relative_pose is not None:
-        for pose_pass in plan.camera_relative_pose.camera_passes:
-            cross_view_out, cross_view_lse = _camera_pose_attention(
-                q, k, v, pose_pass.cameras, num_gen_tokens, pose_pass
-            )  # [1,N_gen,H,D], [1,N_gen,H]
-            cross_view_outs.append(cross_view_out)
-            cross_view_lses.append(cross_view_lse)
-        for other_pass in plan.camera_relative_pose.other_passes:
-            cross_view_out, cross_view_lse = _camera_pose_attention(
-                q, k, v, other_pass, num_gen_tokens
-            )  # [1,N_gen,H,D], [1,N_gen,H]
-            cross_view_outs.append(cross_view_out)
-            cross_view_lses.append(cross_view_lse)
-    elif plan.prope_reference_to_camera is not None and not plan.cross_view_empty:
-        if plan.mrope_cos is None:
-            raise ValueError("A PRoPE cross-view plan keeps mRoPE on its other channels and heads, so must carry it")
-        cross_q, cross_k, cross_v = _prope_cross_view_inputs(q, k, v, raw_q, raw_k, plan)
-        for cross_pass in cross_view_passes(plan):
-            cross_view_out, cross_view_lse = _prope_cross_view_attention(
-                cross_q, cross_k, cross_v, plan, cross_pass, num_gen_tokens
-            )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
-            cross_view_outs.append(cross_view_out)
-            cross_view_lses.append(cross_view_lse)
-    elif not plan.cross_view_empty:
-        cross_q, cross_k = _aligned_cross_view_inputs(q, k, raw_q, raw_k, plan)
-        for cross_pass in cross_view_passes(plan):
-            cross_view_out, cross_view_lse = _aligned_cross_view_attention(
-                cross_q, cross_k, v, cross_pass, num_gen_tokens
-            )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
-            cross_view_outs.append(cross_view_out)
-            cross_view_lses.append(cross_view_lse)
+    with attention_region("cross_view", enabled=not plan.cross_view_empty):
+        cross_view_outs: list[torch.Tensor] = []
+        cross_view_lses: list[torch.Tensor] = []
+        if plan.camera_relative_pose is not None:
+            for pose_pass in plan.camera_relative_pose.camera_passes:
+                cross_view_out, cross_view_lse = _camera_pose_attention(
+                    q, k, v, pose_pass.cameras, num_gen_tokens, pose_pass
+                )  # [1,N_gen,H,D], [1,N_gen,H]
+                cross_view_outs.append(cross_view_out)
+                cross_view_lses.append(cross_view_lse)
+            for other_pass in plan.camera_relative_pose.other_passes:
+                cross_view_out, cross_view_lse = _camera_pose_attention(
+                    q, k, v, other_pass, num_gen_tokens
+                )  # [1,N_gen,H,D], [1,N_gen,H]
+                cross_view_outs.append(cross_view_out)
+                cross_view_lses.append(cross_view_lse)
+        elif plan.prope_reference_to_camera is not None and not plan.cross_view_empty:
+            if plan.mrope_cos is None:
+                raise ValueError(
+                    "A PRoPE cross-view plan keeps mRoPE on its other channels and heads, so must carry it"
+                )
+            cross_q, cross_k, cross_v = _prope_cross_view_inputs(q, k, v, raw_q, raw_k, plan)
+            for cross_pass in cross_view_passes(plan):
+                cross_view_out, cross_view_lse = _prope_cross_view_attention(
+                    cross_q, cross_k, cross_v, plan, cross_pass, num_gen_tokens
+                )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
+                cross_view_outs.append(cross_view_out)
+                cross_view_lses.append(cross_view_lse)
+        elif not plan.cross_view_empty:
+            cross_q, cross_k = _aligned_cross_view_inputs(q, k, raw_q, raw_k, plan)
+            for cross_pass in cross_view_passes(plan):
+                cross_view_out, cross_view_lse = _aligned_cross_view_attention(
+                    cross_q, cross_k, v, cross_pass, num_gen_tokens
+                )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
+                cross_view_outs.append(cross_view_out)
+                cross_view_lses.append(cross_view_lse)
 
     # ── Pass 3: gen->und ──────────────────────────────────────────────────────
     # Every sample's GEN tokens against its own captions and nothing else, which the two offset
     # tensors do -- the pack's own, since the stream handed over is the pack's own. The padding
     # pairs with the causal stream's pad segment, so its rows are written like any other.
-    packed_key_normalized = (
-        packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states
-    )
-    causal_k_normalized, causal_k_normalized_offsets = get_causal_seq(packed_key_normalized)
-    causal_v_unpadded, _ = get_causal_seq(packed_value_states)  # [N_und,kv_heads,head_dim]
+    with attention_region("caption"):
+        packed_key_normalized = (
+            packed_key_states_normalized if packed_key_states_normalized is not None else packed_key_states
+        )
+        causal_k_normalized, causal_k_normalized_offsets = get_causal_seq(packed_key_normalized)
+        causal_v_unpadded, _ = get_causal_seq(packed_value_states)  # [N_und,kv_heads,head_dim]
 
-    # The single-sample branch below is load-bearing, not tidiness. With ranges this pass keys
-    # the whole GEN stream as one of them, so its ``max_seqlen_Q`` is that stream's
-    # length -- and the varlen kernels index a sequence with int32, which overflows once
-    # ``max_seqlen * heads * head_dim`` reaches 2**31: 524288 queries at 32 heads of 128. A
-    # transfer sample doubles its own GEN stream, which is what first crosses that line. The
-    # dense form has no such limit, and one sample never needs the ranges in the first place.
-    if plan.caption_gather is not None:
-        # Per-view captions: a camera view reads the caption written for it, a range clip reads
-        # all of its sample's. That is a key set per *view*, not per sample, so this pass
-        # borrows the same-view partition for its queries -- the same gather, so the same
-        # scatter back -- and keys each group against its own run of captions.
-        assert plan.caption_offsets is not None and plan.caption_q_gather is not None
-        # The same-view partition restricted to the groups that read a caption: a group reading
-        # none leaves the pass rather than being keyed against nothing (see
-        # _restrict_to_caption_readers), so no group the kernel sees has zero keys.
-        attend_k = causal_k_normalized[plan.caption_gather].unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
-        attend_v = causal_v_unpadded[plan.caption_gather].unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
-        reader_gather = plan.caption_q_gather
-        q_offsets, kv_offsets = plan.caption_q_offsets, plan.caption_offsets
-        q_max_len, kv_max_len = plan.caption_q_max_len, plan.caption_max_len
-    else:
-        # ``gen_to_und_gather`` is the sample-level layout under
-        # ``lidar_attends_captions=False``: the tokens that read their sample's one caption,
-        # which is every token unless a LiDAR stream has been cut off from the text. Keyed per
-        # sample either way -- the subset just renumbers the query side, so its own offsets come
-        # along -- and scattered back through the bridge like pass 2, leaving the tokens it
-        # skipped at a log-sum-exp the merge gives no weight, i.e. reading no caption.
-        attend_k = causal_k_normalized.unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
-        attend_v = causal_v_unpadded.unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
-        reader_gather = plan.gen_to_und_gather
-        q_offsets = (
-            full_q_offsets
-            if reader_gather is None
-            # Where each of the pack's own GEN boundaries lands in the gathered stream, which
-            # is the count of gathered tokens before it. Derived rather than stored so it
-            # cannot disagree in length with the causal stream's offsets below: the pack
-            # decides how many segments there are (its samples, plus its pad segment), not
-            # the plan. The gather is built in packed order, so it is sorted, which is what
-            # searchsorted needs.
-            else torch.searchsorted(reader_gather, full_q_offsets.long()).to(torch.int32)
-        )  # [segments+1]
-        kv_offsets = causal_k_normalized_offsets  # [segments+1]
-        q_max_len = int(packed_query_states["max_full_len"]) if reader_gather is None else plan.gen_to_und_max_len
-        kv_max_len = int(packed_key_normalized["max_causal_len"])
-    gen_to_und_out, gen_to_und_lse = attention(
-        (q if reader_gather is None else q[reader_gather]).unsqueeze(0),  # [1,N_readers,heads,head_dim]
-        attend_k,  # [1,N_caption_keys,kv_heads,head_dim]
-        attend_v,  # [1,N_caption_keys,kv_heads,head_dim]
-        cumulative_seqlen_Q=q_offsets,
-        cumulative_seqlen_KV=kv_offsets,
-        max_seqlen_Q=q_max_len,
-        max_seqlen_KV=kv_max_len,
-        return_lse=True,
-    )  # out: [1,N_readers,heads,head_dim], lse: [1,N_readers,heads]
-    if reader_gather is not None:
-        gen_to_und_out, gen_to_und_lse = MergeAttentionsBridge.apply(
-            gen_to_und_out,
-            gen_to_und_lse,
-            _scatter_to_packed(reader_gather, num_gen_tokens),
-            _gather_from_packed(reader_gather),
-        )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
+        # The single-sample branch below is load-bearing, not tidiness. With ranges this pass keys
+        # the whole GEN stream as one of them, so its ``max_seqlen_Q`` is that stream's
+        # length -- and the varlen kernels index a sequence with int32, which overflows once
+        # ``max_seqlen * heads * head_dim`` reaches 2**31: 524288 queries at 32 heads of 128. A
+        # transfer sample doubles its own GEN stream, which is what first crosses that line. The
+        # dense form has no such limit, and one sample never needs the ranges in the first place.
+        if plan.caption_gather is not None:
+            # Per-view captions: a camera view reads the caption written for it, a range clip reads
+            # all of its sample's. That is a key set per *view*, not per sample, so this pass
+            # borrows the same-view partition for its queries -- the same gather, so the same
+            # scatter back -- and keys each group against its own run of captions.
+            assert plan.caption_offsets is not None and plan.caption_q_gather is not None
+            # The same-view partition restricted to the groups that read a caption: a group reading
+            # none leaves the pass rather than being keyed against nothing (see
+            # _restrict_to_caption_readers), so no group the kernel sees has zero keys.
+            attend_k = causal_k_normalized[plan.caption_gather].unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
+            attend_v = causal_v_unpadded[plan.caption_gather].unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
+            reader_gather = plan.caption_q_gather
+            q_offsets, kv_offsets = plan.caption_q_offsets, plan.caption_offsets
+            q_max_len, kv_max_len = plan.caption_q_max_len, plan.caption_max_len
+        else:
+            # ``gen_to_und_gather`` is the sample-level layout under
+            # ``lidar_attends_captions=False``: the tokens that read their sample's one caption,
+            # which is every token unless a LiDAR stream has been cut off from the text. Keyed per
+            # sample either way -- the subset just renumbers the query side, so its own offsets come
+            # along -- and scattered back through the bridge like pass 2, leaving the tokens it
+            # skipped at a log-sum-exp the merge gives no weight, i.e. reading no caption.
+            attend_k = causal_k_normalized.unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
+            attend_v = causal_v_unpadded.unsqueeze(0)  # [1,N_caption_keys,kv_heads,head_dim]
+            reader_gather = plan.gen_to_und_gather
+            q_offsets = (
+                full_q_offsets
+                if reader_gather is None
+                # Where each of the pack's own GEN boundaries lands in the gathered stream, which
+                # is the count of gathered tokens before it. Derived rather than stored so it
+                # cannot disagree in length with the causal stream's offsets below: the pack
+                # decides how many segments there are (its samples, plus its pad segment), not
+                # the plan. The gather is built in packed order, so it is sorted, which is what
+                # searchsorted needs.
+                else torch.searchsorted(reader_gather, full_q_offsets.long()).to(torch.int32)
+            )  # [segments+1]
+            kv_offsets = causal_k_normalized_offsets  # [segments+1]
+            q_max_len = int(packed_query_states["max_full_len"]) if reader_gather is None else plan.gen_to_und_max_len
+            kv_max_len = int(packed_key_normalized["max_causal_len"])
+        gen_to_und_out, gen_to_und_lse = attention(
+            (q if reader_gather is None else q[reader_gather]).unsqueeze(0),  # [1,N_readers,heads,head_dim]
+            attend_k,  # [1,N_caption_keys,kv_heads,head_dim]
+            attend_v,  # [1,N_caption_keys,kv_heads,head_dim]
+            cumulative_seqlen_Q=q_offsets,
+            cumulative_seqlen_KV=kv_offsets,
+            max_seqlen_Q=q_max_len,
+            max_seqlen_KV=kv_max_len,
+            return_lse=True,
+        )  # out: [1,N_readers,heads,head_dim], lse: [1,N_readers,heads]
+        if reader_gather is not None:
+            gen_to_und_out, gen_to_und_lse = MergeAttentionsBridge.apply(
+                gen_to_und_out,
+                gen_to_und_lse,
+                _scatter_to_packed(reader_gather, num_gen_tokens),
+                _gather_from_packed(reader_gather),
+            )  # [1,N_gen,heads,head_dim], [1,N_gen,heads]
 
     # The same-view pass goes first, and that is an invariant rather than an ordering. It is the
     # only branch that covers every row of the stream -- the cross-instant one skips control
@@ -2111,16 +2116,17 @@ def multiview_maskless_gen_attention(
     # Under ``control_attends_sensor=False`` that is exactly why the split is two varlen segments
     # of this pass rather than two passes: either pass alone would leave the other's rows
     # uncovered, and no ordering of the two would fix it.
-    outputs = [same_view_out, *cross_view_outs]
-    lse_tensors = [same_view_lse, *cross_view_lses]
-    # The gen->und pass always ran: a plan whose every item is cut off from the captions is
-    # refused where it is built, so there is always something for it to read.
-    outputs.append(gen_to_und_out)
-    lse_tensors.append(gen_to_und_lse)
-    full_res, _ = merge_attentions(
-        outputs=outputs, lse_tensors=lse_tensors, torch_compile=True
-    )  # [1,N_gen,heads,head_dim]
-    full_out = full_res.squeeze(0).flatten(-2, -1)  # [N_full,heads*head_dim]
+    with attention_region("attention_merge"):
+        outputs = [same_view_out, *cross_view_outs]
+        lse_tensors = [same_view_lse, *cross_view_lses]
+        # The gen->und pass always ran: a plan whose every item is cut off from the captions is
+        # refused where it is built, so there is always something for it to read.
+        outputs.append(gen_to_und_out)
+        lse_tensors.append(gen_to_und_lse)
+        full_res, _ = merge_attentions(
+            outputs=outputs, lse_tensors=lse_tensors, torch_compile=True
+        )  # [1,N_gen,heads,head_dim]
+        full_out = full_res.squeeze(0).flatten(-2, -1)  # [N_full,heads*head_dim]
 
     # Already the pack's own stream length -- the passes covered the padding rather than
     # dropping it, so there is nothing to re-pad -- but the padding's own rows are zeroed. They

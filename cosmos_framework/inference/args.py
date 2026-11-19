@@ -2566,6 +2566,8 @@ class OmniSetupArgs(SetupArgs):
     sample_overrides: OmniSampleOverrides
 
     sampler: Literal["unipc", "edm"]
+    disable_cross_view_attention: bool = False
+    """Auto multiview ablation: remove cross-view/sensor GEN edges, preserving same-view attention and text."""
 
     condition_stream_encode: bool = False
     """Encode causal Transfer controls incrementally with the cached video tokenizer."""
@@ -2650,6 +2652,8 @@ class OmniSetupOverrides(SetupOverrides):
     model_size: Training[ModelSize | None] = None
 
     sampler: Literal["unipc", "edm"] = "unipc"
+    disable_cross_view_attention: bool = False
+    """Disable cross-view/sensor attention for bidirectional Auto multiview experiments."""
 
     condition_stream_encode: bool = False
     """Encode causal Transfer controls incrementally; requires one unsharded GPU per worker."""

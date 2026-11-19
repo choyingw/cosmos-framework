@@ -1,5 +1,8 @@
 # Transfer Auto inference
 
+For per-denoising-step timing and the same-view-only experiment, see
+[step profiling and cross-view ablation](inference_auto_profiling.md).
+
 Cosmos3-Nano-Transfer-Auto generates synchronized camera videos from per-camera
 WSM control videos, optionally with numeric LiDAR output. Both text-to-video
 and image-to-video workflows are supported; image-to-video requires a

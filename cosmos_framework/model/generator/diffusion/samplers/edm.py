@@ -16,10 +16,11 @@ from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 import attrs
 import torch
 
+from cosmos_framework.utils import log
 from cosmos_framework.utils.config import make_freezable
 from cosmos_framework.utils.functional.multi_step import get_multi_step_fn, is_multi_step_fn_supported
 from cosmos_framework.utils.functional.runge_kutta import get_runge_kutta_fn, is_runge_kutta_fn_supported
-from cosmos_framework.utils import log
+from cosmos_framework.utils.step_timing import diffusion_step
 
 COMMON_SOLVER_OPTIONS = Literal["2ab", "2mid", "1euler"]
 
@@ -259,34 +260,41 @@ def differential_equation_solver(
         def step_fn(
             i_th: int, state: Tuple[torch.Tensor, Optional[List[torch.Tensor]]]
         ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-            if step_callback is not None:
-                step_callback(i_th, num_step)
-            input_x_B_StateShape, x0_preds = state  # [B,StateShape]
-            sigma_cur_0, sigma_next_0 = sigmas_L[i_th], sigmas_L[i_th + 1]  # scalar, scalar
+            with diffusion_step(i_th, num_step, sigmas_L[i_th]):
+                if step_callback is not None:
+                    step_callback(i_th, num_step)
+                input_x_B_StateShape, x0_preds = state  # [B,StateShape]
+                sigma_cur_0, sigma_next_0 = sigmas_L[i_th], sigmas_L[i_th + 1]  # scalar, scalar
 
-            # algorithm 2: line 4-6
-            if solver_cfg.s_t_min < sigma_cur_0 < solver_cfg.s_t_max:
-                hat_sigma_cur_0 = sigma_cur_0 + eta * sigma_cur_0  # scalar
-                input_x_B_StateShape = input_x_B_StateShape + (
-                    hat_sigma_cur_0**2 - sigma_cur_0**2
-                ).sqrt() * solver_cfg.s_noise * torch.randn_like(input_x_B_StateShape)  # [B,StateShape]
-                sigma_cur_0 = hat_sigma_cur_0  # scalar
+                # algorithm 2: line 4-6
+                if solver_cfg.s_t_min < sigma_cur_0 < solver_cfg.s_t_max:
+                    hat_sigma_cur_0 = sigma_cur_0 + eta * sigma_cur_0  # scalar
+                    input_x_B_StateShape = input_x_B_StateShape + (
+                        hat_sigma_cur_0**2 - sigma_cur_0**2
+                    ).sqrt() * solver_cfg.s_noise * torch.randn_like(input_x_B_StateShape)  # [B,StateShape]
+                    sigma_cur_0 = hat_sigma_cur_0  # scalar
 
-            if solver_cfg.is_multi:
-                x0_pred_B_StateShape = x0_fn(input_x_B_StateShape, sigma_cur_0 * ones_B)  # [B,StateShape]; sigma: [B]
-                output_x_B_StateShape, x0_preds = update_step_fn(
-                    input_x_B_StateShape, sigma_cur_0 * ones_B, sigma_next_0 * ones_B, x0_pred_B_StateShape, x0_preds
-                )  # [B,StateShape]
-            else:
-                output_x_B_StateShape, x0_preds = update_step_fn(
-                    input_x_B_StateShape, sigma_cur_0 * ones_B, sigma_next_0 * ones_B, x0_fn
-                )  # [B,StateShape]
+                if solver_cfg.is_multi:
+                    x0_pred_B_StateShape = x0_fn(
+                        input_x_B_StateShape, sigma_cur_0 * ones_B
+                    )  # [B,StateShape]; sigma: [B]
+                    output_x_B_StateShape, x0_preds = update_step_fn(
+                        input_x_B_StateShape,
+                        sigma_cur_0 * ones_B,
+                        sigma_next_0 * ones_B,
+                        x0_pred_B_StateShape,
+                        x0_preds,
+                    )  # [B,StateShape]
+                else:
+                    output_x_B_StateShape, x0_preds = update_step_fn(
+                        input_x_B_StateShape, sigma_cur_0 * ones_B, sigma_next_0 * ones_B, x0_fn
+                    )  # [B,StateShape]
 
-            if callback_fns:
-                for callback_fn in callback_fns:
-                    callback_fn(**locals())
+                if callback_fns:
+                    for callback_fn in callback_fns:
+                        callback_fn(**locals())
 
-            return output_x_B_StateShape, x0_preds
+                return output_x_B_StateShape, x0_preds
 
         x_at_eps, _ = fori_loop(0, num_step, step_fn, [input_xT_B_StateShape, None])
         return x_at_eps  # [B,StateShape]

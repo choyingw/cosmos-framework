@@ -1597,6 +1597,12 @@ class OmniInference(Inference):
         assert setup_args.output_dir is not None
 
         sampler_override = setup_args.sampler
+        from cosmos_framework.inference.multiview_ablation import (
+            same_view_model_overrides,
+            without_cross_view_attention,
+        )
+
+        ablation_overrides = same_view_model_overrides() if setup_args.disable_cross_view_attention else []
         parallelism_config = cls._get_parallelism_config(setup_args)
         attention_io_layout = setup_args.attention_io_layout
         compile_config = cls._get_compile_config(setup_args)
@@ -1640,6 +1646,7 @@ class OmniInference(Inference):
                 load_ema_to_reg=setup_args.use_ema_weights,
                 experiment_opts=[
                     *setup_args.experiment_overrides,
+                    *ablation_overrides,
                     f"model.config.rectified_flow_inference_config.scheduler_type={sampler_override}",
                     f"model.config.attention_io_layout={attention_io_layout}",
                 ],
@@ -1743,6 +1750,10 @@ class OmniInference(Inference):
                 model_config_dict = config.model.setdefault("config", {})
                 if "attention_io_layout" in model_config_dict or attention_io_layout != _DEFAULT_ATTENTION_IO_LAYOUT:
                     model_config_dict["attention_io_layout"] = attention_io_layout
+            if setup_args.disable_cross_view_attention:
+                if config is None:
+                    config = Cosmos3OmniConfig.from_pretrained(checkpoint_path)
+                config.model = without_cross_view_attention(config.model)
             hf_model = Cosmos3OmniModel.from_pretrained_dcp(
                 checkpoint_path,
                 config=config,
@@ -1775,6 +1786,21 @@ class OmniInference(Inference):
                 log.debug(f"Sampler overridden to: {sampler_override}")
 
         _warn_ignored_sampler_override(model.config, sampler_override)
+        if setup_args.disable_cross_view_attention and is_causal_multiview_config(model.config):
+            raise ValueError("disable_cross_view_attention is not supported for causal Sim-Auto")
+        if setup_args.profile_step_attention:
+            from cosmos_framework.model.generator.mot.multiview_maskless_attention import maskless_unavailable_reason
+
+            attention_config = model.config.multiview_attention
+            if attention_config.backend not in ("auto", "maskless") or attention_config.mask.attention_scope not in (
+                "decomposed",
+                "same_view",
+            ):
+                raise ValueError("profile_step_attention requires maskless decomposed or same_view attention")
+            if reason := maskless_unavailable_reason(attention_config):
+                raise ValueError(f"profile_step_attention cannot instrument a masked fallback: {reason}")
+            if is_causal_multiview_config(model.config):
+                raise ValueError("profile_step_attention does not instrument causal Sim-Auto cached attention")
         model._prefill_text_kv = setup_args.prefill_text_kv or cpu_offload
         if setup_args.enable_layerwise_offload:
             from cosmos_framework.inference.layerwise_offloading import Cosmos3LayerwiseOffload
@@ -2216,6 +2242,12 @@ class OmniInference(Inference):
         # and downloaded, then silently ignored: generation fell through to the one-shot
         # builder with the raw prompt, full num_frames, and the unsliced control head.
         multiview_flags = [cast(OmniSampleArgs, sa).multiview is not None for sa in sample_args_list]
+        if getattr(getattr(self, "setup_args", None), "disable_cross_view_attention", False) and not all(
+            multiview_flags
+        ):
+            raise ValueError("disable_cross_view_attention requires an Auto multiview request")
+        if getattr(getattr(self, "setup_args", None), "profile_step_attention", False) and not all(multiview_flags):
+            raise ValueError("profile_step_attention requires an Auto multiview request")
         if any(multiview_flags):
             assert all(multiview_flags), "Cannot mix multiview and non-multiview samples in a batch"
             assert len(sample_args_list) == 1, "Batching is not supported for multiview inference"

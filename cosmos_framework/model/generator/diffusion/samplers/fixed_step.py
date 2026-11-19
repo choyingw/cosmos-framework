@@ -17,6 +17,7 @@ from collections.abc import Callable
 import torch
 
 from cosmos_framework.model.generator.diffusion.samplers.utils import run_multiseed
+from cosmos_framework.utils.step_timing import diffusion_step
 
 
 class FixedStepSampler:
@@ -107,44 +108,49 @@ class FixedStepSampler:
         for step_idx, (sigma_cur, sigma_next) in enumerate(
             zip(t_list[:-1], t_list[1:]),
         ):
-            if step_callback is not None:
-                step_callback(step_idx, num_steps_total)
-            timestep = torch.tensor(sigma_cur * self.num_train_timesteps, device=device)
-            v_pred = velocity_fn(latent, timestep.reshape(1, 1))
+            with diffusion_step(step_idx, num_steps_total, sigma_cur * self.num_train_timesteps):
+                if step_callback is not None:
+                    step_callback(step_idx, num_steps_total)
+                timestep = torch.tensor(sigma_cur * self.num_train_timesteps, device=device)
+                v_pred = velocity_fn(latent, timestep.reshape(1, 1))
 
-            def _sde_step(
-                seed: int | None,
-                latent: torch.Tensor,
-                v_pred: torch.Tensor,
-                condition_reference: torch.Tensor | None,
-                condition_mask: torch.Tensor | None,
-            ) -> torch.Tensor:
-                x0_pred = latent - sigma_cur * v_pred  # [...,D]
+                def _sde_step(
+                    seed: int | None,
+                    latent: torch.Tensor,
+                    v_pred: torch.Tensor,
+                    condition_reference: torch.Tensor | None,
+                    condition_mask: torch.Tensor | None,
+                ) -> torch.Tensor:
+                    x0_pred = latent - sigma_cur * v_pred  # [...,D]
 
-                if sigma_next > 0:
-                    if seed is not None:
-                        torch.manual_seed(seed + step_idx)
-                    eps_fresh = torch.randn_like(x0_pred)  # [...,D]
-                    latent_next = (1.0 - sigma_next) * x0_pred + sigma_next * eps_fresh  # [...,D]
-                else:
-                    latent_next = x0_pred  # [...,D]
+                    if sigma_next > 0:
+                        if seed is not None:
+                            torch.manual_seed(seed + step_idx)
+                        eps_fresh = torch.randn_like(x0_pred)  # [...,D]
+                        latent_next = (1.0 - sigma_next) * x0_pred + sigma_next * eps_fresh  # [...,D]
+                    else:
+                        latent_next = x0_pred  # [...,D]
 
-                if condition_reference is not None:
-                    assert condition_mask is not None, "condition_mask is required when condition_reference is set"
-                    condition_reference = condition_reference.to(
-                        dtype=latent_next.dtype, device=latent_next.device
-                    )  # [...,D]
-                    condition_mask = condition_mask.to(dtype=latent_next.dtype, device=latent_next.device)  # [...,D]
-                    latent_next = condition_mask * condition_reference + (1.0 - condition_mask) * latent_next  # [...,D]
-                return latent_next
+                    if condition_reference is not None:
+                        assert condition_mask is not None, "condition_mask is required when condition_reference is set"
+                        condition_reference = condition_reference.to(
+                            dtype=latent_next.dtype, device=latent_next.device
+                        )  # [...,D]
+                        condition_mask = condition_mask.to(
+                            dtype=latent_next.dtype, device=latent_next.device
+                        )  # [...,D]
+                        latent_next = (
+                            condition_mask * condition_reference + (1.0 - condition_mask) * latent_next
+                        )  # [...,D]
+                    return latent_next
 
-            latent = run_multiseed(
-                _sde_step,
-                seed=seed,
-                latent=latent,
-                v_pred=v_pred,
-                condition_reference=condition_reference,
-                condition_mask=condition_mask,
-            )
+                latent = run_multiseed(
+                    _sde_step,
+                    seed=seed,
+                    latent=latent,
+                    v_pred=v_pred,
+                    condition_reference=condition_reference,
+                    condition_mask=condition_mask,
+                )
 
         return latent

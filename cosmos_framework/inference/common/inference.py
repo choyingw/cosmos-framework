@@ -201,7 +201,11 @@ class Inference(ABC):
                     is_save_pass = i_warmup == 0
                     is_profile_pass = profile_in_warmup and i_warmup == self.setup_args.warmup - 1
                     profiler_context = profiler if is_profile_pass else contextlib.nullcontext()
-                    with self._get_timer(f"{self.__class__.__name__}.generate_batch"), profiler_context:
+                    with (
+                        self._get_timer(f"{self.__class__.__name__}.generate_batch"),
+                        profiler_context,
+                        self._step_timing_context(sample_args_batch, i_batch, "warmup", i_warmup),
+                    ):
                         warmup_outputs = self.generate_batch(
                             sample_args_batch,
                             data_batch,
@@ -225,7 +229,11 @@ class Inference(ABC):
                 # measured iteration separately from the first-iteration save pass.
                 should_profile = i_iteration == num_iterations - 1 and profile and not profile_in_warmup
                 profiler_context = profiler if should_profile else contextlib.nullcontext()
-                with self._get_timer(f"{self.__class__.__name__}.generate_batch"), profiler_context:
+                with (
+                    self._get_timer(f"{self.__class__.__name__}.generate_batch"),
+                    profiler_context,
+                    self._step_timing_context(sample_args_batch, i_batch, "measured", i_iteration),
+                ):
                     batch_outputs = self.generate_batch(
                         sample_args_batch,
                         data_batch,
@@ -242,6 +250,33 @@ class Inference(ABC):
                 log.success(f"Saved profile to '{profile_file}'")
 
         return sample_outputs
+
+    def _step_timing_context(self, samples: list[SampleArgs], batch: int, phase: str, iteration: int):
+        if not getattr(self.setup_args, "profile_steps", False):
+            return nullcontext()
+        from cosmos_framework.utils.step_timing import record_diffusion_steps
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        path = samples[0].output_dir / f"diffusion_steps.batch{batch:03d}.{phase}{iteration:03d}.rank{rank:04d}.json"
+        return record_diffusion_steps(
+            path,
+            {
+                "rank": rank,
+                "batch": batch,
+                "phase": phase,
+                "iteration": iteration,
+                "samples": [sample.name for sample in samples],
+                "sampling": [
+                    {
+                        name: getattr(sample, name, None)
+                        for name in ("seed", "resolution", "num_frames", "fps", "num_steps", "guidance", "shift")
+                    }
+                    for sample in samples
+                ],
+                "disable_cross_view_attention": getattr(self.setup_args, "disable_cross_view_attention", False),
+            },
+            attention=getattr(self.setup_args, "profile_step_attention", False),
+        )
 
     def _get_timer(self, func_name: str) -> ContextManager:
         if self._timer is None:

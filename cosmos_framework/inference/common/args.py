@@ -974,6 +974,8 @@ class SetupArgs(ABC, CheckpointArgs, ParallelismArgs, QuantizationArgs, Guardrai
     skip_invalid_samples: bool
     debug: bool
     profile: bool
+    profile_steps: bool = False
+    profile_step_attention: bool = False
     benchmark: bool
     warmup: pydantic.NonNegativeInt
     num_iterations: pydantic.PositiveInt
@@ -1029,6 +1031,10 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, Quantizatio
     """If True, enable debug outputs."""
     profile: bool = False
     """Run profiler and save report to output directory."""
+    profile_steps: bool = False
+    """Write per-denoising-step wall/CUDA timings as JSON and CSV on every rank."""
+    profile_step_attention: bool = False
+    """Also time same-view, cross-view, caption and merge regions; requires eager maskless attention."""
     benchmark: bool = False
     """If set, measures and reports inference runtime (disables tqdm)."""
     warmup: pydantic.NonNegativeInt = 0
@@ -1084,6 +1090,10 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, Quantizatio
     def _build_setup(self):
         if self.num_iterations > 1 and not self.benchmark:
             raise ValueError("num_iterations > 1 requires benchmark=True")
+        if self.profile_step_attention and not self.profile_steps:
+            raise ValueError("profile_step_attention requires profile_steps=True")
+        if self.profile_step_attention and (self.use_torch_compile or self.use_cuda_graphs):
+            raise ValueError("profile_step_attention requires --no-use-torch-compile --no-use-cuda-graphs")
 
     @abstractmethod
     def build_setup(self) -> SetupArgs:

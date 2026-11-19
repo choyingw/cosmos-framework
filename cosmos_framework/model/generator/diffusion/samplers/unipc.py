@@ -7,10 +7,11 @@ from typing import Optional
 import attrs
 import torch
 
-from cosmos_framework.utils.config import make_freezable
-from cosmos_framework.utils.progress_bar import progress_bar
 from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from cosmos_framework.model.generator.diffusion.samplers.utils import run_multiseed
+from cosmos_framework.utils.config import make_freezable
+from cosmos_framework.utils.progress_bar import progress_bar
+from cosmos_framework.utils.step_timing import diffusion_step
 
 
 @make_freezable
@@ -83,34 +84,35 @@ class UniPCSampler(torch.nn.Module):
         latent = noise
 
         for step_index, timestep in enumerate(progress_bar(timesteps, desc="Sampling", total=len(timesteps))):
-            if step_callback is not None:
-                step_callback(step_index, len(timesteps))
-            velocity_pred = velocity_fn(latent, timestep.reshape(1, 1))
+            with diffusion_step(step_index, len(timesteps), timestep):
+                if step_callback is not None:
+                    step_callback(step_index, len(timesteps))
+                velocity_pred = velocity_fn(latent, timestep.reshape(1, 1))
 
-            def _scheduler_step(
-                seed_g: torch.Generator,
-                sample_scheduler: FlowUniPCMultistepScheduler,
-                velocity_pred: torch.Tensor,
-                latent: torch.Tensor,
-            ) -> torch.Tensor:
-                # multistep_uni_p_bh_update and multistep_uni_c_bh_update both use einsum patterns
-                # like "k,bkc...->bc...", which expect the tensor to have at least shape
-                # [B, C, ...] — where b is the batch dimension. Therefore, we need to unsqueeze
-                # the latent tensor to [B, C, ...] before passing it to the scheduler.
-                return sample_scheduler.step(
-                    model_output=velocity_pred,
-                    timestep=timestep,
-                    sample=latent.unsqueeze(0),
-                    return_dict=False,
-                    generator=seed_g,
-                )[0].squeeze(0)
+                def _scheduler_step(
+                    seed_g: torch.Generator,
+                    sample_scheduler: FlowUniPCMultistepScheduler,
+                    velocity_pred: torch.Tensor,
+                    latent: torch.Tensor,
+                ) -> torch.Tensor:
+                    # multistep_uni_p_bh_update and multistep_uni_c_bh_update both use einsum patterns
+                    # like "k,bkc...->bc...", which expect the tensor to have at least shape
+                    # [B, C, ...] — where b is the batch dimension. Therefore, we need to unsqueeze
+                    # the latent tensor to [B, C, ...] before passing it to the scheduler.
+                    return sample_scheduler.step(
+                        model_output=velocity_pred,
+                        timestep=timestep,
+                        sample=latent.unsqueeze(0),
+                        return_dict=False,
+                        generator=seed_g,
+                    )[0].squeeze(0)
 
-            latent = run_multiseed(
-                _scheduler_step,
-                seed_g=seed_g,
-                sample_scheduler=sample_scheduler,
-                velocity_pred=velocity_pred,
-                latent=latent,
-            )
+                latent = run_multiseed(
+                    _scheduler_step,
+                    seed_g=seed_g,
+                    sample_scheduler=sample_scheduler,
+                    velocity_pred=velocity_pred,
+                    latent=latent,
+                )
 
         return latent
