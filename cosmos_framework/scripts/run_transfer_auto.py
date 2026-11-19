@@ -56,6 +56,13 @@ def main():
     parser.add_argument("--mode", choices=("camera", "text2video", "joint"), default="camera")
     parser.add_argument("--resolution", choices=("480", "720"), default="480")
     parser.add_argument("--frames", type=int, help="Generate the first N frames per view (5 or more, 4k+1)")
+    parser.add_argument("--control-type", choices=("wsm", "edge"), help="Edge: use the adapted camera-only model")
+    parser.add_argument(
+        "--edge-source",
+        choices=("rgb", "provided"),
+        default="rgb",
+        help="Derive Canny controls from vision_path, or use existing edge videos in control_path",
+    )
     parser.add_argument("--gpus", type=int, help="Default: all visible GPUs")
     parser.add_argument("--checkpoint", type=Path, help="Reuse a complete local model snapshot")
     parser.add_argument("--revision", default="main", help="Model revision when downloading")
@@ -83,6 +90,13 @@ def main():
         help="Prepare/check inputs without downloading model weights or using GPUs",
     )
     args = parser.parse_args()
+    if args.control_type == "edge":
+        if args.mode == "joint" or args.resolution != "480":
+            parser.error("The edge adaptation requires camera/text2video mode and --resolution 480")
+        if not args.prepare_only and args.checkpoint is None:
+            parser.error("--control-type edge requires --checkpoint pointing to your exported edge fine-tune")
+        if args.frames is None:
+            args.frames = 61
     if args.steps < 1 or (args.gpus is not None and args.gpus < 1):
         parser.error("--steps and --gpus must be positive")
     if args.frames is not None and (args.frames < 5 or (args.frames - 1) % 4):
@@ -110,7 +124,11 @@ def main():
     else:
         local_sample = args.sample_root or os.environ.get("AUTO_SAMPLE_ROOT")
         source = fetch_sample(local_sample) / "input-transfer-auto.jsonl"
-    request = native_request(source, mode=args.mode, caption_folder=None if args.request else args.captions)
+    derive_edges = args.control_type == "edge" and args.edge_source == "rgb"
+    # Keep source RGB available while preparing controls, even for text2video.
+    request = native_request(
+        source, mode="camera" if derive_edges else args.mode, caption_folder=None if args.request else args.captions
+    )
     request.update(
         resolution=args.resolution, aspect_ratio="16,9", num_steps=args.steps, guidance=args.guidance, shift=args.shift
     )
@@ -118,6 +136,10 @@ def main():
         request.update(num_frames=args.frames, num_video_frames_per_chunk=args.frames)
     if args.seed is not None:
         request["seed"] = args.seed
+    if args.control_type is not None:
+        for control in ("wsm", "edge", "blur", "depth", "seg"):
+            request.pop(control, None)
+        request[args.control_type] = {}
     negatives = repo / ".agents/skills/cosmos3-nano-transfer-auto/inference/assets/negative-prompt.txt"
     request["per_view_negative_prompt"] = negatives.read_text().strip()
 
@@ -125,10 +147,27 @@ def main():
     keys = [view["camera_key"] for view in views]
     if not keys or len(keys) != len(set(keys)):
         raise ValueError("Camera keys must be nonempty and unique")
+    if args.control_type == "edge":
+        from cosmos_framework.data.generator.multiview.rig_catalog import MADS_AML_ALT_RIG
+
+        if set(keys) != set(MADS_AML_ALT_RIG):
+            raise ValueError("The edge adaptation requires all seven MADS_AML_ALT_RIG cameras")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    output = (args.output or repo / "outputs/transfer_auto" / stamp).expanduser().absolute()
+    output.mkdir(parents=True, exist_ok=False)
+    if derive_edges:
+        from cosmos_framework.inference.edge_control import write_edge_controls
+
+        write_edge_controls(request, output)
+        if args.mode == "text2video":
+            for view in views:
+                view.pop("vision_path", None)
+            request["multiview"]["condition_video_as_image"] = False
+            request.update(model_mode="text2video", num_conditional_frames=0, condition_frame_indexes_vision=[])
     for view in views:
         info = probe_video(Path(view["control_path"]))
         if info["fps"] != request["fps"] or info["frames"] < request["num_frames"]:
-            raise ValueError(f"WSM timeline does not cover the request: {view['camera_key']}")
+            raise ValueError(f"Control timeline does not cover the request: {view['camera_key']}")
     if request["multiview"].get("condition_video_as_image"):
         validate_rgb_conditions(views, source.parent)
     if "lidar" in request and request["lidar"]["control_path"].endswith(".tar"):
@@ -138,9 +177,6 @@ def main():
         if list(sweeps)[:count] != [i * round(request["fps"] / 10) for i in range(count)]:
             raise ValueError("LiDAR controls do not cover the camera timeline")
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    output = (args.output or repo / "outputs/transfer_auto" / stamp).expanduser().absolute()
-    output.mkdir(parents=True, exist_ok=False)
     if args.frames is not None:
         write_window_captions(request, output)
     prepared = output / "request.json"
@@ -168,6 +204,13 @@ def main():
         checkpoint = Path(snapshot_download(model, revision=revision, ignore_patterns=["assets/**"]))
     if not (checkpoint / "config.json").is_file():
         raise ValueError(f"Expected a complete model snapshot at {checkpoint}")
+    if args.control_type == "edge":
+        metadata = json.loads((checkpoint / "config.json").read_text())
+        if metadata.get("per_view_caption_task") != "av_multiview_edge_transfer":
+            raise ValueError(
+                "Edge inference needs an adapted export with per_view_caption_task=av_multiview_edge_transfer. "
+                "Export the edge training checkpoint with --per-view-caption-task av_multiview_edge_transfer."
+            )
     generated = output / "generated"
     command = [
         sys.executable,

@@ -15,6 +15,7 @@ from typing import Any
 from cosmos_framework.data.generator.augmentors.duration_fps_text_timestamps import DurationFPSTextTimeStamps
 from cosmos_framework.data.generator.augmentors.first_caption_paragraph import FirstCaptionParagraph
 from cosmos_framework.data.generator.augmentors.image_editing_transform import RemoveKeys
+from cosmos_framework.data.generator.augmentors.multiview_edge import MultiviewEdgeControl
 from cosmos_framework.data.generator.augmentors.resolution_text_info import ResolutionTextInfo
 from cosmos_framework.data.generator.augmentors.sequence_plan import (
     MultiviewSequencePlanAugmentor,
@@ -71,12 +72,18 @@ def make_auto_augmentations(config: dict[str, Any]) -> list[Augmentor]:
     if joint and lidar_only:
         raise ValueError("Joint and LiDAR-only tasks are mutually exclusive")
     load_lidar = bool(config.get("load_lidar", False) or joint or lidar_only)
+    edge_control = config.get("camera_control_type", "wsm") == "edge"
+    if edge_control and load_lidar:
+        raise ValueError("Edge adaptation is camera-only; disable joint_cam_lidar_transfer and load_lidar")
     cameras = tuple(config.get("camera_keys", MADS_CAMERAS))
     if lidar_only:
         cameras = ()
     if not cameras and not lidar_only:
         raise ValueError("Camera and joint samples require at least one camera")
     controls = config.get("camera_control_key_mapping", MADS_V1_CONTROL_KEY_MAPPING)
+    if edge_control:
+        controls = None  # Derive from the selected RGB; never open WSM media.
+    has_camera_controls = controls is not None or edge_control
     if joint and controls is None:
         raise ValueError("Joint training requires paired WSM controls")
     resolution = tuple(config.get("resolution_hw", (480, 832)))
@@ -134,6 +141,8 @@ def make_auto_augmentations(config: dict[str, Any]) -> list[Augmentor]:
             minimum_num_frames=config.get("joint_aligned_num_video_frames") if joint else None,
         )
         result.append(ExtractFramesAndCaptions(**extractor))
+        if edge_control:
+            result.append(MultiviewEdgeControl(random_thresholds=config.get("edge_random_thresholds", True)))
     if load_lidar:
         result.append(
             ExtractLidarRange(
@@ -192,7 +201,7 @@ def make_auto_augmentations(config: dict[str, Any]) -> list[Augmentor]:
         result.extend((duration, spatial))
         if lidar_only:
             result.append(LidarTransferToTrainingFormat(conditioning_config=conditioning))
-        elif controls is not None:
+        elif has_camera_controls:
             result.append(
                 MultiviewTransferToTrainingFormat(
                     resolution_hw=resolution,
@@ -208,7 +217,7 @@ def make_auto_augmentations(config: dict[str, Any]) -> list[Augmentor]:
             )
             if per_camera:
                 result.append(EnablePerCameraVAEEncoding())
-    transfer_text = joint or lidar_only or controls is not None
+    transfer_text = joint or lidar_only or has_camera_controls
     cls = TextTokenizerTransformForTransfer if transfer_text else TextTokenizerTransform
     if config.get("tokenizer_config") is not None:
         result.append(
@@ -222,7 +231,9 @@ def make_auto_augmentations(config: dict[str, Any]) -> list[Augmentor]:
                     "tokenize_separately": separate_text,
                     "emit_system_prompt": transfer_text,
                     **(
-                        {"task": "av_joint_camera_lidar_transfer"}
+                        {"task": "av_multiview_edge_transfer"}
+                        if edge_control
+                        else {"task": "av_joint_camera_lidar_transfer"}
                         if joint
                         else {"task": "av_multiview_transfer"}
                         if transfer_text and len(cameras) > 1
@@ -232,7 +243,7 @@ def make_auto_augmentations(config: dict[str, Any]) -> list[Augmentor]:
             )
         )
     remove = ["padding_mask", "original_hw", "camera_keys_selection", "chunk_index", "frame_indices"]
-    if not joint and not lidar_only and controls is not None:
+    if not joint and not lidar_only and has_camera_controls:
         remove.append("control_input")
     result.append(RemoveKeys(input_keys=remove))
     return result

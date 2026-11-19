@@ -175,7 +175,7 @@ def per_view_caption_tasks(config: Any) -> list[str]:
     The task names the system prompt those captions were trained under, and getting it wrong is
     silent: the captions stay well formed and only their opening turn differs from training.
 
-    Only the joint camera+LiDAR task is derived. The plain multiview task additionally depends on
+    Joint camera+LiDAR and explicit edge streams are derived. The plain WSM task additionally depends on
     ``use_transfer_text``, which is not serialized, so a stream that is not joint yields nothing
     here rather than a guess: an absent task tells the caller to decide, a wrong one does not.
 
@@ -185,11 +185,12 @@ def per_view_caption_tasks(config: Any) -> list[str]:
     dataloader_train = _dataloader_train(config)
     if dataloader_train is None:
         return []
-    tasks = {
-        JOINT_CAM_LIDAR_TASK
-        for node in _find_mappings_with_flag(dataloader_train, SEPARATE_VIEW_TEXT_KEY)
-        if node.get(JOINT_CAM_LIDAR_TRANSFER_KEY) is True
-    }
+    tasks = set()
+    for node in _find_mappings_with_flag(dataloader_train, SEPARATE_VIEW_TEXT_KEY):
+        if node.get("camera_control_type") == "edge":
+            tasks.add("av_multiview_edge_transfer")
+        elif node.get(JOINT_CAM_LIDAR_TRANSFER_KEY) is True:
+            tasks.add(JOINT_CAM_LIDAR_TASK)
     return sorted(tasks)
 
 

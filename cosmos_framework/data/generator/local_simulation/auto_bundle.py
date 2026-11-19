@@ -27,12 +27,16 @@ from cosmos_framework.data.generator.multiview.rig_catalog import (
 from cosmos_framework.model.generator.tokenizers.lidar.range_projection import V1P2_TRANSFER_RANGE_PROJECTION
 
 
-def default_transforms(cameras: list[str], height: int) -> dict[str, Any]:
+def default_transforms(cameras: list[str], height: int, *, control_type: str = "wsm") -> dict[str, Any]:
     """Portable final-stage member schema; each stage overrides its own policy."""
     if height not in (480, 720):
         raise ValueError("Reference Auto streams are 480p or 720p")
     if not cameras or len(set(cameras)) != len(cameras) or set(cameras) - set(CAMERA_VIEW_MAPPING):
         raise ValueError("Supply unique, calibrated physical camera keys")
+    if control_type not in ("wsm", "edge"):
+        raise ValueError("control_type must be wsm or edge")
+    if control_type == "edge" and (height != 480 or set(cameras) != set(MADS_AML_ALT_RIG)):
+        raise ValueError("The edge adaptation requires the seven MADS_AML_ALT_RIG cameras at 480p")
     if height == 480:
         rigs = MADS_MODERATE_PLUS_RIGS
         weights = [0.6 if rig == MADS_AML_ALT_RIG else 0.3 if len(rig) == 11 else 0.1 / (len(rigs) - 2) for rig in rigs]
@@ -47,7 +51,7 @@ def default_transforms(cameras: list[str], height: int) -> dict[str, Any]:
     if not eligible:
         eligible = [(cameras, 1.0)]
     total = sum(weight for _, weight in eligible)
-    return dict(
+    policy = dict(
         dataset_name="local_auto",
         resolution_hw=[height, 832 if height == 480 else 1280],
         camera_keys=cameras,
@@ -60,6 +64,8 @@ def default_transforms(cameras: list[str], height: int) -> dict[str, Any]:
         camera_video_key_mapping={key: f"video_{key}" for key in cameras},
         camera_caption_key_mapping={key: f"caption_{key}" for key in set(cameras) | {"camera_front_wide_120fov"}},
         camera_control_key_mapping={key: f"wsm_{key}" for key in cameras},
+        camera_control_type=control_type,
+        edge_random_thresholds=True,
         camera_attribute_mapping=None,
         caption_probability={"caption_structured": 1.0},
         conditioning_config={"__mapping__": [[0, 0.5], [1, 0.5]]},
@@ -96,17 +102,35 @@ def default_transforms(cameras: list[str], height: int) -> dict[str, Any]:
         rgb_view_completion_probability=0.0,
         lidar_fps=10.0,
     )
+    if control_type == "edge":
+        policy.update(
+            dataset_name="local_auto_edge",
+            camera_sampler=None,
+            camera_control_key_mapping=None,
+            num_video_frames=61,
+            require_full_num_frames=True,
+            load_lidar=False,
+            joint_cam_lidar_transfer=False,
+            lidar_dropout_rate=0.0,
+        )
+    return policy
 
 
-def build_bundle(index: Path, tokenizer: Path, output: Path, cameras: list[str], *, hardlink: bool = False) -> None:
+def build_bundle(
+    index: Path, tokenizer: Path, output: Path, cameras: list[str], *, hardlink: bool = False, control_type: str = "wsm"
+) -> None:
     """Create a new bundle; never overwrite an output or modify the input files."""
     index = index.resolve()
     records = [json.loads(line) for line in index.read_text().splitlines() if line.strip()]
     if not records:
         raise ValueError("The input JSONL must contain samples")
-    policies = {str(height): default_transforms(cameras, height) for height in (480, 720)}
+    policies = {
+        str(height): default_transforms(cameras, height, control_type=control_type)
+        for height in ((480,) if control_type == "edge" else (480, 720))
+    }
     identities = set()
-    required = {f"{prefix}_{key}" for key in cameras for prefix in ("video", "wsm", "caption")}
+    prefixes = ("video", "caption") if control_type == "edge" else ("video", "wsm", "caption")
+    required = {f"{prefix}_{key}" for key in cameras for prefix in prefixes}
     required.add("caption_camera_front_wide_120fov")
     prepared = []
     for record in records:
@@ -120,7 +144,7 @@ def build_bundle(index: Path, tokenizer: Path, output: Path, cameras: list[str],
         assets = record["assets"]
         if not isinstance(assets, dict) or required - set(assets):
             raise ValueError(f"Missing camera/control/caption members for sample {identity}")
-        for key in ("lidar/lidar_rangemap", "lidar/hdmap_rangemap"):
+        for key in () if control_type == "edge" else ("lidar/lidar_rangemap", "lidar/hdmap_rangemap"):
             if key not in assets:
                 raise ValueError(f"Joint Auto bundle needs {key}")
         files = {key: (index.parent / relative).resolve() for key, relative in assets.items()}
@@ -171,11 +195,19 @@ def main() -> None:
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--camera-keys", nargs="+", required=True)
+    parser.add_argument("--control-type", choices=("wsm", "edge"), default="wsm")
     parser.add_argument(
         "--hardlink", action="store_true", help="Same filesystem only; linked inputs must remain immutable"
     )
     args = parser.parse_args()
-    build_bundle(args.index, args.tokenizer, args.output, args.camera_keys, hardlink=args.hardlink)
+    build_bundle(
+        args.index,
+        args.tokenizer,
+        args.output,
+        args.camera_keys,
+        hardlink=args.hardlink,
+        control_type=args.control_type,
+    )
     print(args.output.resolve())
 
 

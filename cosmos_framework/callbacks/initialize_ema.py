@@ -15,9 +15,9 @@ from cosmos_framework.utils.callback import Callback
 
 
 class InitializeEmaFromRegular(Callback):
-    """Copy regular weights, including fresh action modules, into a new EMA.
+    """Copy regular weights into a new EMA after weights-only initialization.
 
-    The copy applies only to a fresh Stage 0 warm start. Full-state resume
+    The copy applies only to a fresh warm start from the declared source. Full-state resume
     restores and preserves the saved EMA.
     """
 
@@ -64,8 +64,8 @@ class InitializeEmaFromRegular(Callback):
             # from regular weights would make restart behavior checkpoint-dependent.
             return
         if normalized_path is None or not self._matches_source(normalized_path):
-            raise RuntimeError("Fresh Stage 0 did not load the declared base checkpoint.")
+            raise RuntimeError("Fresh weights-only initialization did not load the declared base checkpoint.")
         if not model.config.ema.enabled:
-            raise RuntimeError("Fresh Bimanual Stage 0 must keep EMA enabled.")
+            raise RuntimeError("Fresh weights-only initialization must keep EMA enabled.")
         model.net_ema_worker.copy_to(src_model=model.net, tgt_model=model.net_ema)
         model.sync_ema_buffers()

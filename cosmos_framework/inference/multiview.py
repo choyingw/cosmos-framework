@@ -179,7 +179,7 @@ def _multiview_system_prompt(model: OmniMoTModel, *, view_prompts: list[str] | N
     an older checkpoint, or streams that disagreed -- so fall back to the shape-based choice that
     predates the key rather than guessing a task.
     """
-    task = exported_caption_task(getattr(model, "config", None))
+    task = getattr(model, "per_view_caption_task", None) or exported_caption_task(getattr(model, "config", None))
     if task is not None and task in _SYSTEM_PROMPTS:
         return _SYSTEM_PROMPTS[task]
     return _SYSTEM_PROMPT_AV_MULTIVIEW_TRANSFER if view_prompts is not None else _SYSTEM_PROMPT_TRANSFER

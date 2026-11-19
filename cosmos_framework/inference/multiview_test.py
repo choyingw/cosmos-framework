@@ -351,6 +351,16 @@ def test_the_system_prompt_follows_the_caption_layout() -> None:
     assert _SYSTEM_PROMPT_AV_MULTIVIEW_TRANSFER != _SYSTEM_PROMPT_TRANSFER
 
 
+def test_edge_system_prompt_uses_runtime_export_metadata() -> None:
+    from cosmos_framework.data.generator.augmentors.text_tokenizer import _SYSTEM_PROMPTS
+
+    # The exported wrapper's task is not a field of the structured model config.
+    model = SimpleNamespace(config=SimpleNamespace(), per_view_caption_task="av_multiview_edge_transfer")
+    assert multiview._multiview_system_prompt(model, view_prompts=["A car."]) == (
+        _SYSTEM_PROMPTS["av_multiview_edge_transfer"]
+    )
+
+
 def _decode_to_pixels(latent_value: float) -> float:
     """The normalisation the caption-chunk path applies to the decoder's output."""
     import torch

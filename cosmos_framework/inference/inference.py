@@ -1871,6 +1871,9 @@ class OmniInference(Inference):
                 exported_metadata, repository=checkpoint_hf.repository if checkpoint_hf is not None else None
             ),
         )
+        # Export metadata is top-level in config.json, outside the structured
+        # model config. Keep the task on the runtime model for multiview batches.
+        model.per_view_caption_task = exported_per_view_caption_task
         pipe = cls(setup_args=setup_args, model=model, vae_decode_stream=vae_decode_stream, **kwargs)
         pipe.per_view_captions = exported_per_view_captions
         pipe.per_view_caption_task = exported_per_view_caption_task

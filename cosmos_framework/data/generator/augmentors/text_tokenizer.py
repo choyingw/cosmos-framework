@@ -11,8 +11,8 @@ from typing import Optional
 import torch
 
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 from cosmos_framework.utils.generator.data_utils import read_positive_int_metadata
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
 
 _MAX_NUM_TOKENS = 4096
 TEXT_SYSTEM_PROMPT_KEY = "text_system_prompt"
@@ -136,6 +136,13 @@ _SYSTEM_PROMPT_AV_MULTIVIEW_TRANSFER = (
     "preserving each camera's viewpoint, shared ego motion, road layout, object identity and motion, weather, "
     f"lighting, and cross-view consistency.\n\n{_AV_WSM_CONTROL_INSTRUCTION}"
 )
+_SYSTEM_PROMPT_AV_MULTIVIEW_EDGE_TRANSFER = (
+    "You are a helpful assistant that generates temporally synchronized, geometrically consistent autonomous-driving "
+    "videos from per-camera scene descriptions and Canny edge control videos. Treat all camera views as simultaneous "
+    "observations of the same driving scene, preserving each camera's viewpoint, shared ego motion, object identity "
+    "and motion, weather, lighting, and cross-view consistency. Follow the edge maps for visible structure and motion; "
+    "use captions for appearance and details that edges do not specify."
+)
 _SYSTEM_PROMPT_AV_JOINT_CAMERA_LIDAR_TRANSFER = (
     "You are a helpful assistant that jointly generates temporally synchronized, geometrically consistent "
     "autonomous-driving camera videos and LiDAR range-view sequences from per-camera scene descriptions and provided "
@@ -150,6 +157,7 @@ _SYSTEM_PROMPTS = {
     "video_editing": _SYSTEM_PROMPT_VIDEO_EDITING,
     "transfer": _SYSTEM_PROMPT_TRANSFER,
     "av_multiview_transfer": _SYSTEM_PROMPT_AV_MULTIVIEW_TRANSFER,
+    "av_multiview_edge_transfer": _SYSTEM_PROMPT_AV_MULTIVIEW_EDGE_TRANSFER,
     "av_joint_camera_lidar_transfer": _SYSTEM_PROMPT_AV_JOINT_CAMERA_LIDAR_TRANSFER,
 }
 

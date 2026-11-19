@@ -9,6 +9,9 @@ matching the allocated GPU driver, and working native TorchCodec/FFmpeg decoding
 Run all commands from the Framework repository root. The workflow below uses
 your local paired recordings, controls and captions.
 
+For seven-view Canny controls replacing WSM at 61 frames and 480p, use the
+[edge adaptation recipe](training_transfer_auto_edge.md).
+
 ## Prepare checkpoints
 
 Download a complete, authorized `nvidia/Cosmos3-Nano` snapshot at an immutable
