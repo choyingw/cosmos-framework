@@ -20,11 +20,42 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def write_window_captions(request: dict, output: Path):
+    """Copy the initial caption interval into this run, leaving downloaded assets intact."""
+    from helpers.wsm_helpers import caption_window
+
+    frames = request["num_frames"]
+    multiview = request["multiview"]
+    entries = [(f"view_{index:02d}", view) for index, view in enumerate(multiview["views"])]
+    if multiview.get("caption_path"):
+        entries.append(("shared", multiview))
+    prepared = []
+    for name, entry in entries:
+        source = Path(entry["caption_path"])
+        caption = caption_window(json.loads(source.read_text()), frames, request["fps"])
+        document = {
+            "caption_structured": {
+                f"chunk_0_{frames}": {
+                    "start_frame": 0,
+                    "end_frame": frames,
+                    "caption": caption,
+                }
+            }
+        }
+        prepared.append((output / "captions" / f"{name}.json", entry, document))
+    for path, entry, document in prepared:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document, indent=2) + "\n")
+        entry["caption_path"] = str(path)
+    multiview["use_first_chunk_only"] = True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--mode", choices=("camera", "text2video", "joint"), default="camera")
     parser.add_argument("--resolution", choices=("480", "720"), default="480")
+    parser.add_argument("--frames", type=int, help="Generate the first N frames per view (5 or more, 4k+1)")
     parser.add_argument("--gpus", type=int, help="Default: all visible GPUs")
     parser.add_argument("--checkpoint", type=Path, help="Reuse a complete local model snapshot")
     parser.add_argument("--revision", default="main", help="Model revision when downloading")
@@ -54,6 +85,8 @@ def main():
     args = parser.parse_args()
     if args.steps < 1 or (args.gpus is not None and args.gpus < 1):
         parser.error("--steps and --gpus must be positive")
+    if args.frames is not None and (args.frames < 5 or (args.frames - 1) % 4):
+        parser.error("--frames must be 4k+1 and at least 5, e.g. 61, 121, 201 or 297")
 
     if args.profile_step_attention and not args.profile_steps:
         parser.error("--profile-step-attention requires --profile-steps")
@@ -81,6 +114,8 @@ def main():
     request.update(
         resolution=args.resolution, aspect_ratio="16,9", num_steps=args.steps, guidance=args.guidance, shift=args.shift
     )
+    if args.frames is not None:
+        request.update(num_frames=args.frames, num_video_frames_per_chunk=args.frames)
     if args.seed is not None:
         request["seed"] = args.seed
     negatives = repo / ".agents/skills/cosmos3-nano-transfer-auto/inference/assets/negative-prompt.txt"
@@ -106,6 +141,8 @@ def main():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (args.output or repo / "outputs/transfer_auto" / stamp).expanduser().absolute()
     output.mkdir(parents=True, exist_ok=False)
+    if args.frames is not None:
+        write_window_captions(request, output)
     prepared = output / "request.json"
     prepared.write_text(json.dumps(request, indent=2) + "\n")
     print(f"Python: {sys.executable}", flush=True)

@@ -34,8 +34,16 @@ JSON/JSONL request uses `--request /path/to/input.jsonl`; its camera mapping,
 caption paths and frame interval are preserved. See `--help` for sampling knobs.
 `--prepare-only` checks/prepares inputs without downloading model weights or
 launching inference. `--mode text2video` omits initial RGB; `--mode joint` includes
-LiDAR. For shorter runs, prepare aligned controls and caption intervals as
-described in the [request guide](../.agents/skills/cosmos3-nano-transfer-auto/inference/references/input-and-execution.md#caption-sidecars).
+LiDAR. To generate a shorter initial interval without supplying a request file,
+add `--frames 61` (or another frame count of at least 5 on the `4k+1` grid).
+The runner sets both the request and chunk frame counts, writes caption copies
+covering `[0, N)` under the new run directory, and clips timestamped descriptions
+using the shared caption-window helper. Original captions and videos are unchanged;
+the inference loader reads the selected control interval. Requested frames must
+fit the available controls and one initial caption interval. The bundled sample
+supports up to 297 aligned frames. See the
+[request guide](../.agents/skills/cosmos3-nano-transfer-auto/inference/references/input-and-execution.md#caption-sidecars)
+for preparing other intervals and longer continuation inputs.
 
 ## Timing boundaries and reports
 
