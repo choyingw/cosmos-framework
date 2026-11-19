@@ -3,7 +3,6 @@
 
 """The ablation must remove cross-camera data dependencies and kernel launches."""
 
-import json
 from pathlib import Path
 
 import pytest
@@ -76,8 +75,8 @@ def test_no_cross_view_ignores_other_camera_but_retains_own_temporal_control_and
     def run(values):
         return dense.multiview_maskless_gen_attention(_pack(q), _pack(k), _pack(values), plan=plan)
 
-    path = tmp_path / "same-view.json"
-    with record_diffusion_steps(path, {}, attention=True):
+    path = tmp_path / "same-view.csv"
+    with record_diffusion_steps(path, {}, attention=True) as recorder:
         with diffusion_step(0, 1):
             baseline = run(v)
     # GEN order: camera-0 frames, camera-1 frames, then each camera's controls.
@@ -89,6 +88,6 @@ def test_no_cross_view_ignores_other_camera_but_retains_own_temporal_control_and
         changed = v.clone()
         changed[token] += 5
         assert not torch.allclose(run(changed)[0], baseline[0])
-    regions = json.loads(path.read_text())["steps"][0]["regions"]
+    regions = recorder.steps[0]["regions"]
     assert regions["cross_view"]["calls"] == 0
     assert regions["same_view"]["calls"] == regions["caption"]["calls"] == 1

@@ -10,15 +10,15 @@ export COSMOS_INTERNAL=0 COSMOS_TRAINING=0
 
 # Reference attention from the checkpoint.
 ./.venv/bin/python -m cosmos_framework.scripts.run_transfer_auto \
-  --mode camera --resolution 480 --seed 0 \
-  --warmup 1 --num-iterations 2 \
+  --mode camera --frames 61 --resolution 480 --seed 0 \
+  --warmup 0 --num-iterations 1 \
   --profile-steps --profile-step-attention \
   --output outputs/auto_attention_baseline
 
 # Identical inputs and sampler; remove cross-view generation attention.
 ./.venv/bin/python -m cosmos_framework.scripts.run_transfer_auto \
-  --mode camera --resolution 480 --seed 0 \
-  --warmup 1 --num-iterations 2 \
+  --mode camera --frames 61 --resolution 480 --seed 0 \
+  --warmup 0 --num-iterations 1 \
   --profile-steps --profile-step-attention \
   --disable-cross-view-attention \
   --output outputs/auto_attention_same_view
@@ -27,7 +27,7 @@ export COSMOS_INTERNAL=0 COSMOS_TRAINING=0
 Both commands use all visible GPUs by default. Set `--gpus N` to choose a smaller
 allocation; context parallelism follows that count. Memory fit still depends on
 the hardware and request. Output directories must be new. The supplied sample
-keeps its 297-frame, 30-FPS interval and seven physical camera identities.
+uses the initial 61 frames at 30 FPS and seven physical camera identities.
 To reuse inputs/weights explicitly, pass `--sample-root /path/to/sample_data`
 and `--checkpoint /path/to/Cosmos3-Nano-Transfer-Auto`. A custom single-sample
 JSON/JSONL request uses `--request /path/to/input.jsonl`; its camera mapping,
@@ -59,24 +59,20 @@ solver loop, such as a continuation chunk; step indices restart from zero.
 Each sample directory contains files such as:
 
 ```text
-diffusion_steps.batch000.warmup000.rank0000.json
-diffusion_steps.batch000.warmup000.rank0000.csv
-diffusion_steps.batch000.measured000.rank0000.json
 diffusion_steps.batch000.measured000.rank0000.csv
-diffusion_steps.batch000.measured001.rank0000.json
-...
 ```
 
-Every rank writes its own report without introducing per-step collectives.
+Only global rank 0 records and writes the profiling CSV. Other ranks create no
+step timers or profiling files; no timing JSON or Chrome trace is produced by
+`--profile-steps`. The commands above each perform exactly one generation.
 Rows include `sampler_run`, zero-based `step_index`, total step count, timestep,
 status, synchronized `wall_ms`, and current-stream `cuda_elapsed_ms`.
 The timestep uses the sampler's native units (sigma for EDM); component UniPC
-records the first component's timestep. Sampling parameters are saved in metadata.
+records the first component's timestep. Rank, phase and iteration are CSV columns.
 Warmup runs remain separate from measured iterations; none of the first steps
 is silently dropped. Failed steps are marked and partial reports are retained.
-Multi-rank measurements are rank-local, not an automatically reduced global
-latency. Compare matching runs and step indices across ranks; do not average
-the ranks and call that the request latency.
+The measurements describe rank 0's device and host; they are not a reduction
+over all GPUs.
 
 `--profile-step-attention` adds disjoint region totals and call counts for
 `same_view`, `cross_view`, `caption`, and `attention_merge`, summed over layers
@@ -93,7 +89,6 @@ current-stream elapsed time, including possible dispatch gaps, rather than
 summed kernel execution time. Profiling synchronization and region events add
 overhead: use identical flags for comparisons. Use total-only `--profile-steps`
 for a less intrusive timing run and separate detail runs to explain the result.
-Add `--profile` for the existing PyTorch Chrome trace with named step/region ranges.
 
 ## No-cross-view experiment
 

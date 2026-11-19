@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import time
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -97,33 +96,17 @@ class StepTimingRecorder:
             self._regions.append((name, (time.perf_counter() - start) * 1000, begin, end))
 
     def write(self, path: Path, metadata: dict[str, Any]):
+        path = path.with_suffix(".csv")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "metadata": metadata,
-                    "timing": {
-                        "wall_ms": "Host elapsed time, synchronizing this rank's CUDA device at step boundaries.",
-                        "cuda_elapsed_ms": "CUDA event interval on this rank's current stream; not summed kernel time.",
-                        "regions": "Optional maskless attention regions, summed over layers and CFG evaluations.",
-                        "excludes": "Model loading, encoding, decoding, output export and rank aggregation.",
-                        "overhead": "Step synchronization and optional region events perturb execution; use identical settings.",
-                    },
-                    "steps": self.steps,
-                },
-                indent=2,
-            )
-            + "\n"
-        )
         rows = []
         for step in self.steps:
             row = {key: value for key, value in step.items() if key != "regions"}
             for name, values in step["regions"].items():
                 row.update({f"{name}_{key}": value for key, value in values.items()})
+            row.update({key: value for key, value in metadata.items() if isinstance(value, (str, int, float, bool))})
             rows.append(row)
         fields = list(dict.fromkeys(key for row in rows for key in row)) or ["step_index", "wall_ms"]
-        with path.with_suffix(".csv").open("w", newline="") as handle:
+        with path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
@@ -131,6 +114,10 @@ class StepTimingRecorder:
 
 @contextmanager
 def record_diffusion_steps(path: Path, metadata: dict[str, Any], *, attention: bool = False):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else metadata.get("rank", 0)
+    if rank != 0:
+        yield None
+        return
     recorder = StepTimingRecorder(attention=attention)
     token = _RECORDER.set(recorder)
     try:

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import copy
-import json
+import csv
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -91,13 +91,14 @@ def test_detail_profiling_rejects_uninstrumented_execution(overrides, message):
         OmniSetupOverrides(checkpoint_path="unused-test-checkpoint", **overrides)._build_setup()
 
 
-def test_warmup_measured_and_rank_reports_are_separate(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("rank", [0, 3])
+def test_only_rank_zero_writes_csv_for_each_iteration(tmp_path: Path, monkeypatch, rank):
     from cosmos_framework.inference.common import inference as module
     from cosmos_framework.utils.step_timing import diffusion_step
 
     monkeypatch.setattr(module, "sync_distributed_errors", nullcontext)
     monkeypatch.setattr(module.torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(module.torch.distributed, "get_rank", lambda: 3)
+    monkeypatch.setattr(module.torch.distributed, "get_rank", lambda: rank)
     sample = SimpleNamespace(name="seven_views", output_dir=tmp_path)
     saves = []
 
@@ -131,11 +132,15 @@ def test_warmup_measured_and_rank_reports_are_separate(tmp_path: Path, monkeypat
     pipe = Inference(setup_args=setup, model=None, guardrails=None, _timer=None)
     pipe.generate([sample])
     assert saves == [True, False, False]
-    paths = sorted(tmp_path.glob("*.json"))
-    assert len(paths) == len(list(tmp_path.glob("*.csv"))) == 3
+    assert not list(tmp_path.glob("*.json"))
+    paths = sorted(tmp_path.glob("*.csv"))
+    assert len(paths) == (3 if rank == 0 else 0)
+    phases = []
     for path in paths:
-        report = json.loads(path.read_text())
-        assert len(report["steps"]) == 2
-        assert report["metadata"]["rank"] == 3
-        assert report["metadata"]["disable_cross_view_attention"] is True
-    assert [json.loads(path.read_text())["metadata"]["phase"] for path in paths].count("warmup") == 1
+        with path.open() as handle:
+            rows = list(csv.DictReader(handle))
+        assert len(rows) == 2
+        assert rows[0]["rank"] == "0"
+        assert rows[0]["disable_cross_view_attention"] == "True"
+        phases.append(rows[0]["phase"])
+    assert phases.count("warmup") == (1 if rank == 0 else 0)

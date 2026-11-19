@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import csv
-import json
 import time
 from pathlib import Path
 
@@ -15,8 +14,8 @@ pytestmark = [pytest.mark.L0, pytest.mark.CPU]
 
 
 def test_step_reports_keep_runs_and_regions_separate(tmp_path: Path):
-    path = tmp_path / "steps.json"
-    with record_diffusion_steps(path, {"phase": "measured", "rank": 2}, attention=True):
+    path = tmp_path / "steps.csv"
+    with record_diffusion_steps(path, {"phase": "measured", "rank": 0}, attention=True) as recorder:
         for _ in range(2):
             for index in range(3):
                 with diffusion_step(index, 3, torch.tensor(900 - 100 * index)):
@@ -25,35 +24,36 @@ def test_step_reports_keep_runs_and_regions_separate(tmp_path: Path):
                             time.sleep(0.001)
                     with attention_region("cross_view", enabled=False):
                         pass
-    document = json.loads(path.read_text())
-    steps = document["steps"]
+    steps = recorder.steps
     assert [(step["sampler_run"], step["step_index"]) for step in steps] == [
         (run, index) for run in range(2) for index in range(3)
     ]
-    assert document["metadata"] == {"phase": "measured", "rank": 2}
     for step in steps:
         assert step["status"] == "success" and step["wall_ms"] >= 2
         assert step["regions"]["same_view"]["calls"] == 2
         assert step["regions"]["cross_view"]["calls"] == 0
         assert step["timestep"] == 900 - 100 * step["step_index"]
-    with path.with_suffix(".csv").open() as handle:
+    with path.open() as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 6 and rows[0]["same_view_calls"] == "2"
+    assert rows[0]["rank"] == "0" and rows[0]["phase"] == "measured"
+    assert not list(tmp_path.glob("*.json"))
 
 
 def test_exception_writes_partial_step_and_restores_recorder(tmp_path: Path):
-    path = tmp_path / "partial.json"
+    path = tmp_path / "partial.csv"
     with pytest.raises(RuntimeError, match="failed forward"):
-        with record_diffusion_steps(path, {}, attention=True):
+        with record_diffusion_steps(path, {}, attention=True) as recorder:
             with diffusion_step(0, 1):
                 with attention_region("same_view"):
                     raise RuntimeError("failed forward")
-    document = json.loads(path.read_text())
-    assert document["steps"][0]["status"] == "error"
-    assert document["steps"][0]["regions"]["same_view"]["calls"] == 1
+    assert recorder.steps[0]["status"] == "error"
+    assert recorder.steps[0]["regions"]["same_view"]["calls"] == 1
     with diffusion_step(0, 1), attention_region("same_view"):
         pass
-    assert len(json.loads(path.read_text())["steps"]) == 1
+    with path.open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1 and rows[0]["status"] == "error"
 
 
 @pytest.mark.parametrize("kind", ["unipc", "fixed", "edm", "component"])
@@ -104,11 +104,11 @@ def test_profiling_preserves_sampler_outputs_and_includes_scheduler(tmp_path: Pa
 
     expected = sample()
     callbacks.clear()
-    path = tmp_path / "sampler.json"
-    with record_diffusion_steps(path, {}, attention=True):
+    path = tmp_path / "sampler.csv"
+    with record_diffusion_steps(path, {}, attention=True) as recorder:
         actual = sample()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    steps = json.loads(path.read_text())["steps"]
+    steps = recorder.steps
     assert [(step["step_index"], step["num_steps"]) for step in steps] == callbacks
     assert len(steps) == 3
     assert all(step["regions"]["same_view"]["calls"] >= 1 for step in steps)
@@ -135,12 +135,26 @@ def test_cuda_events_are_read_only_after_step_synchronization(tmp_path: Path, mo
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: object())
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: operations.append("sync"))
     monkeypatch.setattr(torch.cuda, "Event", Event)
-    path = tmp_path / "cuda.json"
-    with record_diffusion_steps(path, {}, attention=True):
+    path = tmp_path / "cuda.csv"
+    with record_diffusion_steps(path, {}, attention=True) as recorder:
         with diffusion_step(0, 1):
             with attention_region("same_view"):
                 pass
-    step = json.loads(path.read_text())["steps"][0]
+    step = recorder.steps[0]
     assert step["cuda_elapsed_ms"] == step["regions"]["same_view"]["cuda_elapsed_ms"] == 1.25
     assert step["regions"]["cross_view"]["cuda_elapsed_ms"] == 0
     assert operations.count("sync") == 2
+
+
+def test_nonzero_rank_neither_times_nor_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 3)
+    monkeypatch.setattr(
+        "cosmos_framework.utils.step_timing.StepTimingRecorder",
+        lambda **kwargs: pytest.fail("Nonzero rank created a timer"),
+    )
+    with record_diffusion_steps(tmp_path / "rank3.csv", {}, attention=True) as recorder:
+        assert recorder is None
+        with diffusion_step(0, 1), attention_region("same_view"):
+            pass
+    assert not list(tmp_path.glob("*.csv")) and not list(tmp_path.glob("*.json"))

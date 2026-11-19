@@ -16,6 +16,29 @@ from cosmos_framework.data.generator.multiview.rig_catalog import MADS_AML_ALT_R
 SAMPLE_REPO = "nvidia/Cosmos3-Nano-Transfer-Auto"
 
 
+def validate_pretrained_initialization(directory: Path) -> Path:
+    """Refuse absent/incomplete regular weights before launching a dummy fine-tune."""
+    from torch.distributed.checkpoint import FileSystemReader
+
+    directory = directory.expanduser().absolute()
+    model = directory / "model"
+    if not (model / ".metadata").is_file():
+        raise FileNotFoundError(
+            f"Missing pretrained DCP: {model / '.metadata'}. Convert the released Transfer-Auto snapshot "
+            "with cosmos_framework.scripts.prepare_sim_auto_checkpoint first."
+        )
+    weights = FileSystemReader(model).read_metadata().state_dict_metadata
+    regular = [name for name in weights if name.startswith("net.")]
+    missing = [
+        group
+        for group in ("moe_gen", "time_embedder", "vae2llm", "llm2vae", "rig_view_embed")
+        if not any(group in name for name in regular)
+    ]
+    if missing:
+        raise ValueError(f"Pretrained DCP lacks regular model weights for: {', '.join(missing)}")
+    return directory
+
+
 def inference_sample_helpers():
     """Reuse the exact sample downloader/checksums/caption window used by run_transfer_auto."""
     cookbook = Path(__file__).resolve().parents[2] / ".agents/skills/cookbooks/cosmos3/simulation/auto"
@@ -158,6 +181,13 @@ def main() -> None:
         missing = [key for key in required if not os.environ.get(key)]
         if missing:
             parser.error("Set the model/VAE paths before training: " + ", ".join(missing))
+        try:
+            initialization = validate_pretrained_initialization(Path(os.environ[required[0]]))
+            for key in required[1:]:
+                if not Path(os.environ[key]).expanduser().is_file():
+                    raise FileNotFoundError(f"{key} does not point to a VAE weights file: {os.environ[key]}")
+        except (ValueError, FileNotFoundError) as error:
+            parser.error(str(error))
     try:
         local_sample = args.sample_root or os.environ.get("AUTO_SAMPLE_ROOT")
         sample = inference_sample_helpers().fetch_sample(
@@ -189,8 +219,13 @@ def main() -> None:
             COSMOS_TRAINING="1",
             COSMOS_INTERNAL="0",
             COSMOS_TRANSFER_AUTO_LOCAL_BUNDLE=str(output / "bundle"),
+            COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP=str(initialization),
             IMAGINAIRE_OUTPUT_ROOT=str(output / "training"),
         )
+        print(
+            f"Pretrained initialization: {initialization} (strict regular-weight load; fresh optimizer/EMA)", flush=True
+        )
+        print("Trainable: full shared generation experts, time embedding, video adapters and rig embeddings; LoRA off")
         print(f"Dummy training: repeat daytime_scene for {args.steps} updates on {gpus} GPUs", flush=True)
         print(shlex.join(command), flush=True)
         subprocess.run(command, cwd=Path(__file__).resolve().parents[2], env=training_environment, check=True)

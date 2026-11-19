@@ -206,6 +206,15 @@ copies the loaded regular model into a new EMA; optimizer, scheduler and
 iteration counters start fresh. Same-job auto-resume restores its saved state
 and preserves its EMA. Use a fresh job name for an independent adaptation.
 
+The dummy-training launcher first checks that the initialization DCP exists and
+contains regular generation-expert, timestep, video-adapter and rig-embedding
+weights. Both VAE paths must exist. The native strict load then checks the full
+model state and tensor shapes; absent model weights cannot silently turn the
+dummy run into training from scratch. The source is the released checkpoint
+converted by `prepare_sim_auto_checkpoint` above. No new control-specific branch
+is initialized: the shared generation experts and adapters are adapted from
+their pretrained values.
+
 Export a completed training checkpoint using the **resolved config.yaml saved
 by that run** (the dry run prints its location):
 
@@ -229,6 +238,26 @@ checkpoint records `per_view_captions: true` and
 edge-specific system instruction as training.
 
 ## Generate without a request file
+
+For the **original pretrained Transfer-Auto model**, run the following on the
+same initial 61-frame daytime sequence. This uses its released WSM controls:
+
+```bash
+python -m cosmos_framework.scripts.run_transfer_auto \
+  --checkpoint "$TRANSFER_AUTO_HF" \
+  --control-type wsm --mode camera --frames 61 --resolution 480 --seed 0 \
+  --warmup 0 --num-iterations 1 \
+  --profile-steps --profile-step-attention \
+  --output outputs/pretrained_sample_61
+```
+
+The profiling artifact is only
+`diffusion_steps.batch000.measured000.rank0000.csv` under the generated sample
+directory. It retains step wall/CUDA timing and same-view, cross-view, caption
+and attention-merge CPU/CUDA columns. Other ranks do not write timing files;
+there is no timing JSON or Chrome trace for this command.
+
+After edge fine-tuning, use the exported edge checkpoint as follows.
 
 The existing runner can use its built-in seven-camera reference recording and
 derive Canny controls from the RGB videos:

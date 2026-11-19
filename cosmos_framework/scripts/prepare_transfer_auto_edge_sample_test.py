@@ -7,6 +7,8 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
+import torch.distributed.checkpoint as dcp
 
 from cosmos_framework.data.generator.multiview.rig_catalog import MADS_AML_ALT_RIG
 from cosmos_framework.scripts import prepare_transfer_auto_edge_sample as setup
@@ -32,6 +34,17 @@ def _sample(tmp_path):
             )
         )
     return root
+
+
+def _pretrained(tmp_path, *, omit=None):
+    directory = tmp_path / "pretrained"
+    state = {
+        f"net.{name}.weight": torch.full((2, 2), 0.125)
+        for name in ("q_proj_moe_gen", "time_embedder", "vae2llm", "llm2vae", "rig_view_embed")
+        if name != omit
+    }
+    dcp.save(state, checkpoint_id=directory / "model")
+    return directory
 
 
 def test_sample_preparation_builds_only_recorded_rgb_and_caption_assets(tmp_path):
@@ -98,12 +111,12 @@ def test_dummy_launch_uses_the_inference_sample_and_one_sequence(tmp_path, monke
         ),
     )
     monkeypatch.delenv("AUTO_SAMPLE_ROOT", raising=False)
-    for key in (
-        "COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP",
-        "COSMOS_TRANSFER_AUTO_VIDEO_VAE",
-        "COSMOS_TRANSFER_AUTO_LIDAR_VAE",
-    ):
-        monkeypatch.setenv(key, "/existing/model/asset")
+    pretrained = _pretrained(tmp_path)
+    vae = tmp_path / "vae.safetensors"
+    vae.touch()
+    monkeypatch.setenv("COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP", str(pretrained))
+    for key in ("COSMOS_TRANSFER_AUTO_VIDEO_VAE", "COSMOS_TRANSFER_AUTO_LIDAR_VAE"):
+        monkeypatch.setenv(key, str(vae))
     monkeypatch.setattr("torch.cuda.device_count", lambda: 2)
     launched = []
     monkeypatch.setattr(setup.subprocess, "run", lambda command, **kwargs: launched.append((command, kwargs)))
@@ -131,4 +144,18 @@ def test_dummy_launch_uses_the_inference_sample_and_one_sequence(tmp_path, monke
     assert "model_parallel.context_parallel_size=2" in command
     assert options["env"]["COSMOS_TRAINING"] == "1"
     assert options["env"]["COSMOS_TRANSFER_AUTO_LOCAL_BUNDLE"] == str(output / "bundle")
+    assert options["env"]["COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP"] == str(pretrained)
     assert options["env"]["IMAGINAIRE_OUTPUT_ROOT"] == str(output / "training")
+
+
+def test_pretrained_preflight_requires_real_dcp_and_all_adapted_modules(tmp_path):
+    with pytest.raises(FileNotFoundError, match="Missing pretrained DCP"):
+        setup.validate_pretrained_initialization(tmp_path / "missing")
+    incomplete = _pretrained(tmp_path, omit="q_proj_moe_gen")
+    with pytest.raises(ValueError, match="moe_gen"):
+        setup.validate_pretrained_initialization(incomplete)
+
+
+def test_pretrained_preflight_accepts_covered_regular_weights(tmp_path):
+    pretrained = _pretrained(tmp_path)
+    assert setup.validate_pretrained_initialization(pretrained) == pretrained

@@ -1032,7 +1032,7 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, Quantizatio
     profile: bool = False
     """Run profiler and save report to output directory."""
     profile_steps: bool = False
-    """Write per-denoising-step wall/CUDA timings as JSON and CSV on every rank."""
+    """Write per-denoising-step wall/CUDA timings as CSV on rank 0 only."""
     profile_step_attention: bool = False
     """Also time same-view, cross-view, caption and merge regions; requires eager maskless attention."""
     benchmark: bool = False

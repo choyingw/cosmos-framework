@@ -257,7 +257,9 @@ class Inference(ABC):
         from cosmos_framework.utils.step_timing import record_diffusion_steps
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        path = samples[0].output_dir / f"diffusion_steps.batch{batch:03d}.{phase}{iteration:03d}.rank{rank:04d}.json"
+        if rank != 0:
+            return nullcontext()
+        path = samples[0].output_dir / f"diffusion_steps.batch{batch:03d}.{phase}{iteration:03d}.rank0000.csv"
         return record_diffusion_steps(
             path,
             {
