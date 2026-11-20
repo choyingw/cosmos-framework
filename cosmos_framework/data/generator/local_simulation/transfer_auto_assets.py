@@ -59,15 +59,22 @@ def snapshot_weights(snapshot: Path) -> list[Path]:
     raise FileNotFoundError(f"No pretrained model weights in {snapshot}")
 
 
+def snapshot_tokenizer(snapshot: Path) -> Path:
+    for folder in (snapshot / "text_tokenizer", snapshot):
+        if (folder / "tokenizer_config.json").is_file():
+            return folder
+    raise FileNotFoundError(f"No local text tokenizer in {snapshot}")
+
+
 def validate_snapshot(snapshot: Path) -> Path:
     for name in (
         "config.json",
-        "text_tokenizer/tokenizer_config.json",
         "lidar_vae/diffusion_pytorch_model.safetensors",
     ):
         if not (snapshot / name).is_file():
             raise FileNotFoundError(f"Incomplete pretrained snapshot: {snapshot / name}")
     snapshot_weights(snapshot)
+    snapshot_tokenizer(snapshot)
     return snapshot
 
 
@@ -106,15 +113,17 @@ def resolve_training_assets(*, checkpoint: Path | None = None, tokenizer: Path |
     from huggingface_hub import hf_hub_download
     from huggingface_hub.constants import HF_HOME
 
-    initialization = os.environ.get("COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP")
+    # An explicit teacher snapshot must not accidentally reuse an initialization
+    # exported in the shell by a DIFFERENT (e.g. original WSM) training run.
+    initialization = None if checkpoint else os.environ.get("COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP")
     video = os.environ.get("COSMOS_TRANSFER_AUTO_VIDEO_VAE") or os.environ.get("WAN_VAE_PATH")
     lidar = os.environ.get("COSMOS_TRANSFER_AUTO_LIDAR_VAE")
-    tokenizer = tokenizer or os.environ.get("LOCAL_QWEN_TOKENIZER")
+    tokenizer = tokenizer or (None if checkpoint else os.environ.get("LOCAL_QWEN_TOKENIZER"))
     snapshot = None
     if checkpoint or not all((initialization, tokenizer, lidar)):
         snapshot = resolve_snapshot(checkpoint)
     if tokenizer is None:
-        tokenizer = snapshot / "text_tokenizer"
+        tokenizer = snapshot_tokenizer(snapshot)
     tokenizer = Path(tokenizer).expanduser().absolute()
     if not tokenizer.is_dir():
         raise FileNotFoundError(f"Matching local text tokenizer is missing: {tokenizer}")

@@ -243,6 +243,7 @@ python -m cosmos_framework.scripts.export_model \
   --config-file "$EDGE_RUN_CONFIG" \
   --checkpoint-path "$EDGE_TRAIN_CHECKPOINT" \
   --output-dir "$EDGE_HF" \
+  --no-vit \
   --bundle-lidar-vae \
   --per-view-captions on \
   --per-view-caption-task av_multiview_edge_transfer
@@ -252,6 +253,12 @@ The recipe also lets export derive the edge task automatically. The exported
 checkpoint records `per_view_captions: true` and
 `per_view_caption_task: "av_multiview_edge_transfer"`; inference uses the same
 edge-specific system instruction as training.
+
+Use `--no-vit` for this generation-only workflow. The recipe clears
+`vlm_config.pretrained_weights.backbone_path` because the released DCP supplies
+the language/generation weights, and the exporter otherwise tries to resolve
+that empty path for a reasoner vision tower. Camera RGB and Canny controls use
+the video VAE; `--no-vit` keeps that tokenizer and the generation network intact.
 
 ## Generate without a request file
 

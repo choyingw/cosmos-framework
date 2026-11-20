@@ -14,12 +14,26 @@ the state-dict keys ``<path>.lora_A.weight`` and ``<path>.lora_B.weight``.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from cosmos_framework.utils import log
+
+_LORA_DISABLED: ContextVar[bool] = ContextVar("dense_teacher_lora_disabled", default=False)
+
+
+@contextmanager
+def disable_lora():
+    """Use the immutable pretrained weight for a shared dense teacher pass."""
+    token = _LORA_DISABLED.set(True)
+    try:
+        yield
+    finally:
+        _LORA_DISABLED.reset(token)
 
 
 class LoraInjectedLinear(nn.Linear):
@@ -88,6 +102,8 @@ class LoraInjectedLinear(nn.Linear):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = F.linear(x, self.weight, self.bias)
+        if not torch.compiler.is_compiling() and _LORA_DISABLED.get():
+            return base_out
         adapter_input = self.lora_dropout(x).to(dtype=self.lora_A.weight.dtype)
         lora_out = self.lora_B(self.lora_A(adapter_input)).to(dtype=base_out.dtype)
         return base_out + self._lora_scale * lora_out

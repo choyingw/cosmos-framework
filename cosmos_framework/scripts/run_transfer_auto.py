@@ -211,6 +211,9 @@ def main():
                 "Edge inference needs an adapted export with per_view_caption_task=av_multiview_edge_transfer. "
                 "Export the edge training checkpoint with --per-view-caption-task av_multiview_edge_transfer."
             )
+        bca_config = metadata.get("model", {}).get("config", {})
+        if bca_config.get("bca_enabled") and keys != bca_config["bca_camera_keys"]:
+            raise ValueError("BCA inference camera order must match the calibrated training camera order")
     generated = output / "generated"
     command = [
         sys.executable,

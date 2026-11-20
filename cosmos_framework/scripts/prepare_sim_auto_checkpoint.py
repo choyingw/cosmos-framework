@@ -64,10 +64,13 @@ def main() -> None:
             bucket_name="",
             object_store_credential_path_pretrained="",
         )
-    if (source / "text_tokenizer").is_dir():
+    from cosmos_framework.data.generator.local_simulation.transfer_auto_assets import snapshot_tokenizer
+
+    tokenizer_directory = snapshot_tokenizer(source)
+    if tokenizer_directory.is_dir():
         model_config["vlm_config"]["tokenizer"] = dict(
             _target_="cosmos_framework.data.generator.local_simulation.dataset.load_bundle_tokenizer",
-            directory=str(source / "text_tokenizer"),
+            directory=str(tokenizer_directory),
         )
     model_config["lidar_tokenizer"].update(
         vae_path=str(lidar_vae),

@@ -21,6 +21,7 @@ def test_converter_saves_and_reloads_public_config_with_local_tokenizer(tmp_path
     source = tmp_path / "source"
     source.mkdir()
     (source / "text_tokenizer").mkdir()
+    (source / "text_tokenizer/tokenizer_config.json").write_text("{}")
     (source / "lidar_vae").mkdir()
     (source / "lidar_vae/diffusion_pytorch_model.safetensors").touch()
     video_vae = tmp_path / "Wan2.2_VAE.pth"

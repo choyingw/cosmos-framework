@@ -169,7 +169,8 @@ def test_generated_dummy_command_resolves_through_the_native_config_loader():
     assert get_config_module(config) == "cosmos_framework.configs.simulation.config"
 
 
-def test_dummy_without_model_env_uses_resolved_assets(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bca", [False, True])
+def test_dummy_without_model_env_uses_resolved_assets(tmp_path, monkeypatch, bca):
     root = _sample(tmp_path)
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
@@ -197,8 +198,19 @@ def test_dummy_without_model_env_uses_resolved_assets(tmp_path, monkeypatch):
     launched = []
     monkeypatch.setattr(setup.subprocess, "run", lambda command, **kwargs: launched.append(kwargs))
     output = tmp_path / "dummy"
-    monkeypatch.setattr(sys, "argv", ["setup", "--train-dummy", "--steps", "10", "--output", str(output)])
+    arguments = ["setup", "--train-dummy", "--steps", "10", "--output", str(output)]
+    teacher = None
+    if bca:
+        teacher = tmp_path / "edge_teacher"
+        teacher.mkdir()
+        (teacher / "config.json").write_text(json.dumps({"per_view_caption_task": "av_multiview_edge_transfer"}))
+        arguments.extend(["--bca", "--checkpoint", str(teacher)])
+    monkeypatch.setattr(sys, "argv", arguments)
     setup.main()
-    assert calls == [{"checkpoint": None, "tokenizer": None}]
+    assert calls == [{"checkpoint": teacher, "tokenizer": None}]
     assert all(launched[0]["env"][key] == value for key, value in resolved.items())
     assert (output / "bundle/manifest.json").is_file()
+    if bca:
+        calibration = json.loads(launched[0]["env"]["COSMOS_BCA_CALIBRATION_JSON"])
+        assert set(setup.MADS_AML_ALT_RIG) <= calibration["cameras"].keys()
+        assert "experiment=transfer_auto_bca_61_480" in (output / "command.txt").read_text()

@@ -1853,6 +1853,12 @@ def multiview_maskless_gen_attention(
     """
     # ── GEN streams, trimmed to their real tokens ─────────────────────────────
     _check_plan_matches_pack(plan, packed_query_states)
+    bca_operator = None
+    if not torch.compiler.is_compiling():
+        from cosmos_framework.model.generator.mot.bca import active_bca, record_plan
+
+        record_plan(plan)
+        bca_operator = active_bca()
 
     full_q, full_q_offsets = get_full_only_seq(packed_query_states)  # [N_full,heads,head_dim]
     full_k, _ = get_full_only_seq(packed_key_states)  # [N_full,kv_heads,head_dim]
@@ -2002,7 +2008,11 @@ def multiview_maskless_gen_attention(
     with attention_region("cross_view", enabled=not plan.cross_view_empty):
         cross_view_outs: list[torch.Tensor] = []
         cross_view_lses: list[torch.Tensor] = []
-        if plan.camera_relative_pose is not None:
+        if bca_operator is not None:
+            cross_view_out, cross_view_lse = bca_operator(q, k, v, plan)
+            cross_view_outs.append(cross_view_out)
+            cross_view_lses.append(cross_view_lse)
+        elif plan.camera_relative_pose is not None:
             for pose_pass in plan.camera_relative_pose.camera_passes:
                 cross_view_out, cross_view_lse = _camera_pose_attention(
                     q, k, v, pose_pass.cameras, num_gen_tokens, pose_pass

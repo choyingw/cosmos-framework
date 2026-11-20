@@ -238,6 +238,47 @@ def test_export_entry_resolves_vision_source(tier, local_override, source, tmp_p
         assert downloads[0].include == (helpers.EDGE_VIT_BUNDLE_HF_INCLUDE if tier == "edge" else expected.include)
 
 
+def test_transfer_auto_edge_no_vit_export_keeps_video_conditioning_without_backbone_download(tmp_path, monkeypatch):
+    # The export entry initializes these at import time; keep the test isolated.
+    for key, value in (("COSMOS_TRAINING", "1"), ("COSMOS_DEVICE", "cpu"), ("TOKENIZERS_PARALLELISM", "false")):
+        monkeypatch.setenv(key, value)
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    from cosmos_framework.configs.simulation.common.transfer_auto_edge import make_transfer_auto_edge_experiment
+    from cosmos_framework.scripts import export_model as exporter
+
+    model_dict = OmegaConf.to_container(make_transfer_auto_edge_experiment().model, resolve=False)
+    video_tokenizer = dict(model_dict["config"]["tokenizer"])
+    assert model_dict["config"]["vlm_config"]["pretrained_weights"]["backbone_path"] == ""
+
+    class BeforeModelConstruction(Exception):
+        pass
+
+    def stop(model):
+        assert model["config"]["vlm_config"]["model_instance"]["config"]["include_visual"] is False
+        assert model["config"]["tokenizer"] == video_tokenizer
+        assert model["config"]["vision_gen"] is True
+        raise BeforeModelConstruction
+
+    monkeypatch.setattr(exporter, "_coerce_to_base_model", stop)
+    monkeypatch.setattr(
+        exporter, "resolve_vision_checkpoint_path", lambda **kwargs: pytest.fail("Unexpected ViT download")
+    )
+    checkpoint = SimpleNamespace(load_model_config_dict=lambda: model_dict)
+    args = SimpleNamespace(
+        checkpoint=SimpleNamespace(build_checkpoint=lambda **kwargs: checkpoint),
+        output_dir=tmp_path / "exported",
+        config_only=False,
+        bundle_lidar_vae=True,
+        vit=False,
+        vit_checkpoint_path=None,
+    )
+    with pytest.raises(BeforeModelConstruction):
+        exporter.export_model(args)
+
+
 def test_public_preset_backbones_agree_between_training_and_export(monkeypatch, tmp_path):
     import huggingface_hub
 

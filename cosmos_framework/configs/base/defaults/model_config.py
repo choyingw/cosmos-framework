@@ -5,7 +5,6 @@ from typing import Any, Literal
 
 import attrs
 
-from cosmos_framework.utils.lazy_config import LazyDict
 from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.configs.base.defaults.ema import EMAConfig
@@ -17,6 +16,7 @@ from cosmos_framework.configs.base.defaults.reasoner import VLMConfig
 from cosmos_framework.model.generator.mot.action_io_projector import ACTION_IO_PROJECTOR_TYPES
 from cosmos_framework.model.generator.utils.load_balancing_stats import LBLConfig
 from cosmos_framework.model.generator.utils.sr_latent_noise import SRLatentConditionNoiseConfig
+from cosmos_framework.utils.lazy_config import LazyDict
 
 # Keep these layout names compatible with exported checkpoint metadata.
 # Define the type locally so configuration loading needs no separate workspace package.
@@ -292,6 +292,24 @@ class OmniMoTModelConfig:
     # to_empty + init_weights. Pair with `optimizer.keys_to_select=["lora_"]`
     # and `checkpoint.keys_to_skip_loading=[..., "lora_"]`.
     lora_enabled: bool = False
+    # Paper 5919 BCA: shared GEN pathway, camera-only maskless partition.
+    bca_enabled: bool = False
+    bca_calibration_json: str = ""
+    bca_camera_keys: list[str] = attrs.field(factory=list)
+    bca_start_block: int = 10
+    bca_end_block: int = 20
+    bca_local_budget: int = 32
+    bca_global_budget: int = 512
+    bca_global_pool: int = 8
+    bca_depth_samples: int = 8
+    bca_min_depth: float = 1.0
+    bca_max_depth: float = 120.0
+    bca_inference_ratio: float = 0.35
+    bca_query_chunk: int = 128
+    bca_distillation: bool = False
+    bca_prediction_weight: float = 1.0
+    bca_feature_weight: float = 0.5
+    bca_feature_pool: int = 4
     lora_rank: int = 16
     lora_alpha: int = 32
     lora_target_modules: str = "q_proj_moe_gen,k_proj_moe_gen,v_proj_moe_gen,o_proj_moe_gen"

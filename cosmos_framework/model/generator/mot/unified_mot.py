@@ -851,15 +851,25 @@ class PackedAttentionMoT(nn.Module):
         else:
             packed_key_states_normalized_ = None
 
-        packed_attn_output, kv_to_store = self.dispatch_attention_fn(
-            packed_query_states_,
-            packed_key_states_,
-            packed_value_states_,
-            attention_mask,
-            natten_metadata=natten_metadata,
-            memory_value=memory_value,
-            packed_key_states_normalized=packed_key_states_normalized_,
-        )
+        from contextlib import nullcontext
+
+        operator = getattr(self, "bca_attention", None)
+        if operator is not None:
+            from cosmos_framework.model.generator.mot.bca import bca_layer
+
+            context = bca_layer(operator)
+        else:
+            context = nullcontext()
+        with context:
+            packed_attn_output, kv_to_store = self.dispatch_attention_fn(
+                packed_query_states_,
+                packed_key_states_,
+                packed_value_states_,
+                attention_mask,
+                natten_metadata=natten_metadata,
+                memory_value=memory_value,
+                packed_key_states_normalized=packed_key_states_normalized_,
+            )
 
         # Produce kv_to_store for MemoryState.write_for_layer() when the
         # dispatch didn't already provide one (e.g. standard or AR frame-0

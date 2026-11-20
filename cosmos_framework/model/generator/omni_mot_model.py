@@ -21,13 +21,31 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.nn.modules.module import _IncompatibleKeys
 
-from cosmos_framework.utils.flags import DEVICE, Device
-from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
-from cosmos_framework.utils.lazy_config.registry import locate
+from cosmos_framework.configs.base.defaults.joint_attention import JointAttnImplementation
+from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
+from cosmos_framework.configs.base.defaults.multiview_attention import upgrade_saved_multiview_attention
+from cosmos_framework.configs.base.defaults.parallelism import PRECISION_TO_TORCH_DTYPE
+from cosmos_framework.data.generator.action.utils.action_processing import (
+    ActionProcessor,
+    get_action_processing_records,
+)
+from cosmos_framework.data.generator.action.utils.unified_action_schema import UNIFIED_ACTION_SLOT_GROUPS
+from cosmos_framework.data.generator.sequence_packing import (
+    PackedSequence,
+    SequencePlan,
+    build_sequence_plans_from_data_batch,
+    pack_input_sequence,
+)
+from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
+from cosmos_framework.data.generator.sequence_packing.packers import (
+    is_item_generated,
+    pack_multiview_action_conditioning,
+    replicate_multiview_actions,
+    uses_single_timestep,
+    validate_cross_view_fps,
+)
+from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
 from cosmos_framework.model._base import ImaginaireModel
-from cosmos_framework.utils import log, misc
-from cosmos_framework.utils.count_params import count_params
 from cosmos_framework.model.generator.algorithm.loss.flow_matching import (
     ACTION_SLOT_SAMPLE_COUNT_KEY,
     ACTION_SLOT_SAMPLE_LOSS_KEY,
@@ -40,16 +58,6 @@ from cosmos_framework.model.generator.algorithm.loss.modality_reduction import (
     build_modality_loss_items,
     reduce_global_modality_means,
 )
-from cosmos_framework.configs.base.defaults.joint_attention import JointAttnImplementation
-from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
-from cosmos_framework.configs.base.defaults.multiview_attention import upgrade_saved_multiview_attention
-from cosmos_framework.configs.base.defaults.parallelism import PRECISION_TO_TORCH_DTYPE
-from cosmos_framework.data.generator.action.utils.action_processing import (
-    ActionProcessor,
-    get_action_processing_records,
-)
-from cosmos_framework.data.generator.action.utils.unified_action_schema import UNIFIED_ACTION_SLOT_GROUPS
-from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
 from cosmos_framework.model.generator.diffusion.rectified_flow import RectifiedFlow
 from cosmos_framework.model.generator.diffusion.samplers.edm import EDMSampler
 from cosmos_framework.model.generator.diffusion.samplers.fixed_step import FixedStepSampler
@@ -78,6 +86,8 @@ from cosmos_framework.model.generator.sensor_encoder import (
     get_vae_pixel_shapes,
     normalize_uint8_item,
 )
+from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
+from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
 from cosmos_framework.model.generator.utils.batch_normalization import normalize_vision_batch_inplace
 from cosmos_framework.model.generator.utils.camera_relative_pose import (
     prepare_camera_relative_poses,
@@ -111,27 +121,17 @@ from cosmos_framework.model.generator.utils.sr_latent_noise import (
     apply_sr_latent_condition_noise,
     sr_sample_mask,
 )
-from cosmos_framework.data.generator.sequence_packing import (
-    PackedSequence,
-    SequencePlan,
-    build_sequence_plans_from_data_batch,
-    pack_input_sequence,
-)
-from cosmos_framework.data.generator.sequence_packing.modality import add_special_tokens
-from cosmos_framework.data.generator.sequence_packing.packers import (
-    is_item_generated,
-    pack_multiview_action_conditioning,
-    replicate_multiview_actions,
-    uses_single_timestep,
-    validate_cross_view_fps,
-)
-from cosmos_framework.model.generator.tokenizers.interface import VideoTokenizerInterface
-from cosmos_framework.model.generator.upsampler.prompts import build_messages, clean_response
+from cosmos_framework.utils import log, misc
+from cosmos_framework.utils.count_params import count_params
+from cosmos_framework.utils.flags import DEVICE, Device
 from cosmos_framework.utils.generator.data_utils import get_vision_data_resolution, read_positive_int_metadata
 from cosmos_framework.utils.generator.dtensor_helper import DTensorFastEmaModelUpdater
 from cosmos_framework.utils.generator.model_weights_stats import WeightTrainingStat
 from cosmos_framework.utils.generator.parallelism import ParallelDims
 from cosmos_framework.utils.generator.quantization import swap_modelopt_fp8_linears_on_meta
+from cosmos_framework.utils.lazy_config import LazyDict
+from cosmos_framework.utils.lazy_config import instantiate as lazy_instantiate
+from cosmos_framework.utils.lazy_config.registry import locate
 
 # "LIDA" in ASCII: fixed domain tag separating joint LiDAR noise from RGB.
 # Changing this value changes all joint LiDAR inference noise.
@@ -513,7 +513,6 @@ class OmniMoTModel(ImaginaireModel):
         else:
             self.tokenizer_sound_gen = None
 
-
     def build_net(
         self,
         dtype: torch.dtype,
@@ -643,6 +642,10 @@ class OmniMoTModel(ImaginaireModel):
                     lora_alpha=self.config.lora_alpha,
                     lora_target_modules=self.config.lora_target_modules,
                 )
+            if self.config.bca_enabled:
+                from cosmos_framework.model.generator.mot.bca import install_bca
+
+                install_bca(net, self.config)
 
         # Swap ModelOpt FP8 linears BEFORE FSDP wrap and materialization, for the
         # same reason LoRA is injected early. `fully_shard` wraps the whole network
@@ -707,6 +710,10 @@ class OmniMoTModel(ImaginaireModel):
                     net.init_weights(buffer_device=DEVICE)
                 if lora_enabled:
                     self._init_lora_weights_post_materialization(net)
+                if self.config.bca_enabled:
+                    from cosmos_framework.model.generator.mot.bca import initialize_bca
+
+                    initialize_bca(net)
 
         return net
 
@@ -1788,10 +1795,13 @@ class OmniMoTModel(ImaginaireModel):
 
         # Network forward pass
         memory = self.build_memory_state(packed_sequence, memory_info)  # pylint: disable=assignment-from-none
-        out_net = self.denoise(
-            data_batch_packed=packed_sequence,
-            memory=memory,
-        )
+        bca_losses = {}
+        if self.config.bca_distillation:
+            from cosmos_framework.model.generator.mot.bca_distillation import teacher_student_forward
+
+            out_net, bca_losses = teacher_student_forward(self, packed_sequence, memory)
+        else:
+            out_net = self.denoise(data_batch_packed=packed_sequence, memory=memory)
 
         loss, losses_dict = self._compute_losses(
             out_net=out_net,
@@ -1805,6 +1815,10 @@ class OmniMoTModel(ImaginaireModel):
             timesteps_radar=timesteps_radar,
         )
 
+        if bca_losses:
+            loss = loss + self.config.bca_prediction_weight * bca_losses["bca_prediction_loss"]
+            loss = loss + self.config.bca_feature_weight * bca_losses["bca_feature_loss"]
+            losses_dict.update(bca_losses)
         _vision_tokens = len(packed_sequence.vision.sequence_indexes) if packed_sequence.vision else 0
         _action_tokens = len(packed_sequence.action.sequence_indexes) if packed_sequence.action else 0
         _sound_tokens = len(packed_sequence.sound.sequence_indexes) if packed_sequence.sound else 0

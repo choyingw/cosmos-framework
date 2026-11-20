@@ -127,3 +127,15 @@ def test_snapshot_requires_every_pretrained_shard(tmp_path):
     (snapshot / "model-00001.safetensors").touch()
     with pytest.raises(FileNotFoundError, match="Incomplete pretrained weight shards"):
         assets.validate_snapshot(snapshot)
+
+
+def test_explicit_teacher_ignores_previous_run_initialization(automatic_assets, monkeypatch):
+    snapshot, _, calls = automatic_assets
+    monkeypatch.setenv("COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP", "/previous/wsm/dcp")
+    # Fine-tuned exports store the bundled tokenizer at the snapshot root.
+    (snapshot / "tokenizer_config.json").write_text("{}")
+    (snapshot / "text_tokenizer/tokenizer_config.json").unlink()
+    result = assets.resolve_training_assets(checkpoint=snapshot)
+    assert result["COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP"] != "/previous/wsm/dcp"
+    assert result["LOCAL_QWEN_TOKENIZER"] == str(snapshot)
+    assert len(calls) == 1

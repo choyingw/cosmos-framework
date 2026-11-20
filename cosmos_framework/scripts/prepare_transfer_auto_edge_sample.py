@@ -101,7 +101,7 @@ def prepare_sample(sample_root: Path, tokenizer: Path, output: Path, *, captions
     return environment
 
 
-def dummy_training_command(*, gpus: int, steps: int) -> list[str]:
+def dummy_training_command(*, gpus: int, steps: int, bca: bool = False) -> list[str]:
     """Repeat the one-sequence bundle through the native infinite training loader."""
     return [
         sys.executable,
@@ -118,8 +118,8 @@ def dummy_training_command(*, gpus: int, steps: int) -> list[str]:
         "--experiment-module",
         "cosmos_framework.configs.simulation.experiment.auto.transfer_auto_edge",
         "--",
-        "experiment=transfer_auto_edge_61_480",
-        "job.name=edge_dummy",
+        "experiment=transfer_auto_bca_61_480" if bca else "experiment=transfer_auto_edge_61_480",
+        "job.name=bca_dummy" if bca else "job.name=edge_dummy",
         f"trainer.max_iter={steps}",
         f"checkpoint.save_iter={steps}",
         "checkpoint.dcp_async_mode_enabled=False",
@@ -153,11 +153,37 @@ def main() -> None:
     )
     parser.add_argument("--steps", type=int, default=10, help="Dummy training updates (default: 10)")
     parser.add_argument("--gpus", type=int, help="Dummy training GPU count; defaults to all visible GPUs")
+    parser.add_argument("--bca", action="store_true", help="Distill a BCA student from the dense edge checkpoint")
+    parser.add_argument(
+        "--bca-calibration", type=Path, help="Matching calibration; default is the supplied Bosch sample rig"
+    )
     args = parser.parse_args()
     if args.steps < 1 or (args.gpus is not None and args.gpus < 1):
         parser.error("--steps and --gpus must be positive")
+    if args.bca and not args.train_dummy:
+        parser.error("--bca requires --train-dummy")
     try:
         training_assets = {}
+        if args.bca:
+            checkpoint = args.checkpoint or os.environ.get("TRANSFER_AUTO_HF")
+            if not checkpoint:
+                parser.error("--bca needs --checkpoint pointing to the exported dense edge-finetuned teacher")
+            args.checkpoint = Path(checkpoint).expanduser().absolute()
+            metadata = json.loads((args.checkpoint / "config.json").read_text())
+            teacher_config = metadata.get("model", {}).get("config", {})
+            if metadata.get("per_view_caption_task") != "av_multiview_edge_transfer" or teacher_config.get(
+                "bca_enabled"
+            ):
+                parser.error("The BCA teacher must be a dense edge-finetuned checkpoint, before BCA/LoRA adaptation")
+            if teacher_config.get("lora_enabled"):
+                parser.error("Merge existing teacher LoRA adapters before using them as a fixed BCA teacher")
+            calibration_path = args.bca_calibration or (
+                Path(__file__).resolve().parents[2]
+                / "cosmos_framework/configs/simulation/assets/bca_daytime_calibration.json"
+            )
+            calibration = json.loads(calibration_path.read_text())
+            if set(MADS_AML_ALT_RIG) - set(calibration.get("cameras", {})):
+                parser.error("BCA calibration must cover all seven camera views")
         if args.train_dummy:
             import torch
 
@@ -169,6 +195,8 @@ def main() -> None:
             from cosmos_framework.data.generator.local_simulation.transfer_auto_assets import resolve_training_assets
 
             training_assets = resolve_training_assets(checkpoint=args.checkpoint, tokenizer=args.tokenizer)
+            if args.bca:
+                training_assets["COSMOS_BCA_CALIBRATION_JSON"] = json.dumps(calibration)
         local_sample = args.sample_root or os.environ.get("AUTO_SAMPLE_ROOT")
         sample = inference_sample_helpers().fetch_sample(
             resolve_sample_root(Path(local_sample)) if local_sample else None
@@ -192,7 +220,7 @@ def main() -> None:
     print(f"Load these training paths: source {shlex.quote(str(environment))}")
     if args.train_dummy:
         initialization = training_assets["COSMOS_TRANSFER_AUTO_EDGE_INIT_DCP"]
-        command = dummy_training_command(gpus=gpus, steps=args.steps)
+        command = dummy_training_command(gpus=gpus, steps=args.steps, bca=args.bca)
         output = environment.parent
         (output / "command.txt").write_text(shlex.join(command) + "\n")
         training_environment = os.environ.copy()
@@ -206,7 +234,14 @@ def main() -> None:
         print(
             f"Pretrained initialization: {initialization} (strict regular-weight load; fresh optimizer/EMA)", flush=True
         )
-        print("Trainable: full shared generation experts, time embedding, video adapters and rig embeddings; LoRA off")
+        if args.bca:
+            print(
+                "Trainable: BCA register queries + rank-16 LoRA; frozen dense teacher; local=32 global=512, inference residual=35%"
+            )
+        else:
+            print(
+                "Trainable: full shared generation experts, time embedding, video adapters and rig embeddings; LoRA off"
+            )
         print(f"Dummy training: repeat daytime_scene for {args.steps} updates on {gpus} GPUs", flush=True)
         print(shlex.join(command), flush=True)
         subprocess.run(command, cwd=Path(__file__).resolve().parents[2], env=training_environment, check=True)
