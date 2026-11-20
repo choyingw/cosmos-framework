@@ -228,9 +228,13 @@ def test_native_maskless_dispatch_replaces_only_cross_view_partition(monkeypatch
 
 
 @pytest.mark.parametrize("checkpoint_mode", ["none", "full", "selective"])
-def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registers(checkpoint_mode, monkeypatch):
+@pytest.mark.parametrize("backend", ["reference", "optimized"])
+def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registers(
+    checkpoint_mode, backend, monkeypatch
+):
     """Exercise the actual distillation helper/merge backward on a tiny CPU network."""
     monkeypatch.setattr("cosmos_framework.model.generator.mot.activation_marks._MARKING_ENABLED", False)
+    monkeypatch.setattr(BudgetCrossView, "forward", getattr(BudgetCrossView, f"forward_{backend}"))
 
     class Block(torch.nn.Module):
         def __init__(self):

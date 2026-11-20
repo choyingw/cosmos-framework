@@ -10,8 +10,10 @@ and capture-time visibility policy. Dense same-view and caption passes stay nati
 from __future__ import annotations
 
 import math
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -96,6 +98,77 @@ def importance_indices(values: torch.Tensor, shape: tuple[int, int, int], ratio:
     scores = (features - reference).square().sum(-1)
     scores.scatter_(1, representatives, float("inf"))
     return scores.topk(keep, dim=-1).indices.sort(dim=-1).values
+
+
+@lru_cache(maxsize=64)
+def _representatives(shape, heads, seeds, device):
+    """Only cache input-independent random representatives, never K/V or graphs."""
+    frames, height, width = shape
+    count = frames * height * width
+    t, y, x = torch.meshgrid(*(torch.arange(n, device=device) for n in shape), indexing="ij")
+    cells = (
+        (t // 2) * math.ceil(height / 2) * math.ceil(width / 2) + (y // 2) * math.ceil(width / 2) + x // 2
+    ).flatten()
+    n_cells = math.ceil(frames / 2) * math.ceil(height / 2) * math.ceil(width / 2)
+    rows = cells.expand(heads, -1)
+    tokens = torch.arange(count, device=device).expand(heads, -1)
+    representatives = []
+    for seed in seeds:
+        generator = torch.Generator(device=device).manual_seed(seed)
+        random = torch.rand((heads, count), generator=generator, device=device)
+        maxima = random.new_full((heads, n_cells), -1)
+        maxima.scatter_reduce_(1, rows, random, reduce="amax", include_self=True)
+        reps = torch.zeros((heads, n_cells), device=device, dtype=torch.long)
+        winners = random == maxima.gather(1, rows)
+        reps.scatter_reduce_(1, rows, torch.where(winners, tokens, 0), reduce="amax")
+        representatives.append(reps)
+    return cells, torch.stack(representatives)
+
+
+def batched_importance_indices(values, shape, ratio, seeds):
+    """Batch all source cameras/roles; retain the reference's exact RNG and budget."""
+    from cosmos_framework.model.generator.mot.bca_attention import fused_supported
+
+    batch, count, heads, dim = values.shape
+    if count != math.prod(shape) or len(seeds) != batch or not 0 <= ratio <= 1:
+        raise ValueError("Invalid BCA residual grid, seeds or ratio")
+    if not fused_supported(values):
+        return torch.stack(
+            [importance_indices(v, shape, ratio, seed=seed) for v, seed in zip(values, seeds, strict=True)]
+        )
+    keep = math.ceil(count * ratio)
+    if keep in (0, count):
+        return torch.arange(keep, device=values.device).expand(batch, heads, -1)
+    cells, representatives = _representatives(shape, heads, tuple(seeds), values.device)
+    if keep < representatives.shape[-1]:
+        raise ValueError("Residual retention is below the protected 2x2x2 representative-cell floor")
+    from cosmos_framework.model.generator.mot.bca_kernels import residual_scores
+
+    scores = torch.empty((batch, heads, count), device=values.device, dtype=torch.float32)
+    with torch.cuda.device(values.device):
+        residual_scores[((count + 31) // 32, batch * heads)](
+            values.contiguous(),
+            representatives,
+            cells,
+            scores,
+            count,
+            heads,
+            dim,
+            representatives.shape[-1],
+            1 << (dim - 1).bit_length(),
+            32,
+        )
+    return scores.topk(keep, dim=-1).indices.sort(dim=-1).values
+
+
+@lru_cache(maxsize=4)
+@torch.inference_mode(False)
+def _device_routes(calibration, cameras, height, width, budget, depths, minimum, maximum, frames, roles, device):
+    route, valid = local_routes(calibration, cameras, height, width, budget, depths, minimum, maximum)
+    pixels, views = height * width, len(cameras)
+    source_role = torch.arange(budget) % roles
+    indices = ((source_role * views + route // pixels) * frames) * pixels + route % pixels
+    return indices.to(device), valid.to(device)
 
 
 def head_gather(tensor, indices):
@@ -194,7 +267,7 @@ class BudgetCrossView(nn.Module):
             scores.float().logsumexp(-1).transpose(1, 2),
         )
 
-    def forward(self, query, key, value, plan):
+    def forward_reference(self, query, key, value, plan):
         self.last_plan = plan
         views = len(self.cameras)
         # Explicitly support the seven-camera, aligned control+target experiment.
@@ -305,6 +378,130 @@ class BudgetCrossView(nn.Module):
                         )
                         output[offset + start : offset + stop] = out
                         normalizers[offset + start : offset + stop] = lse
+        output, normalizers = output.unsqueeze(0), normalizers.unsqueeze(0)
+        if torch.is_grad_enabled():
+            return DifferentiablePartitionBridge.apply(output, normalizers)
+        return output, normalizers
+
+    def forward(self, query, key, value, plan):
+        from cosmos_framework.model.generator.mot.bca_attention import fused_supported
+
+        backend = os.environ.get("COSMOS_BCA_BACKEND", "auto")
+        if backend not in ("auto", "reference"):
+            raise ValueError("COSMOS_BCA_BACKEND must be auto or reference")
+        if backend == "reference" or not fused_supported(query):
+            return self.forward_reference(query, key, value, plan)
+        return self.forward_optimized(query, key, value, plan)
+
+    def forward_optimized(self, query, key, value, plan):
+        from cosmos_framework.model.generator.mot.bca_attention import (
+            attention_with_lse,
+            indexed_attention_with_shared,
+        )
+
+        self.last_plan = plan
+        views = len(self.cameras)
+        if (
+            len(plan.items_per_sample) != 1
+            or len(set(plan.token_shapes)) != 1
+            or any(n != views for n in plan.num_views)
+            or any(axis != 0 for axis in plan.view_axis)
+            or len(set(plan.seconds_per_frame)) != 1
+        ):
+            raise ValueError("BCA requires one synchronized camera-only sample with a fixed rig/grid/rate")
+        total_frames, height, width = plan.token_shapes[0]
+        if total_frames % views:
+            raise ValueError("BCA camera grid does not divide into complete frames")
+        frames, pixels, roles = total_frames // views, height * width, len(plan.token_shapes)
+        count, heads, kv_heads, dim = roles * total_frames * pixels, query.shape[1], key.shape[1], self.head_dim
+        if count != plan.num_gen_tokens or heads % kv_heads:
+            raise ValueError("BCA packed grid or grouped query heads are inconsistent")
+        q = query[:count].reshape(roles, views, frames, pixels, heads, dim)
+        k = key[:count].reshape(roles, views, frames, pixels, kv_heads, dim)
+        v = value[:count].reshape_as(k)
+        route, valid = _device_routes(
+            self.calibration,
+            self.cameras,
+            height,
+            width,
+            self.local_budget,
+            self.depth_samples,
+            self.depth_min,
+            self.depth_max,
+            frames,
+            roles,
+            query.device,
+        )
+        # Pool each source frame ONCE, instead of once for every overlapping time window.
+        pooled_k, pooled_v = self._summaries(
+            k.reshape(roles, views, -1, kv_heads, dim),
+            v.reshape(roles, views, -1, kv_heads, dim),
+            (frames, height, width),
+        )
+        pooled_k = pooled_k.reshape(roles, views, frames, -1, kv_heads, dim)
+        pooled_v = pooled_v.reshape_as(pooled_k)
+        neighbors = torch.zeros((views, views), dtype=torch.bool, device=query.device)
+        for view in range(views):
+            neighbors[
+                view, list(PHYSICAL_NEIGHBORS[view] if views == 7 else tuple(i for i in range(views) if i != view))
+            ] = True
+        others = torch.tensor([[i for i in range(views) if i != view] for view in range(views)], device=query.device)
+        register_q = self.bca_register_queries.to(key.dtype).expand(-1, kv_heads, -1)
+        register_q = register_q[None].expand(views, -1, -1, -1)
+        output = torch.zeros_like(query)
+        normalizers = query.new_full(query.shape[:2], -torch.inf, dtype=torch.float32)
+        output_grid = output[:count].view(roles, views, frames, pixels, heads, dim)
+        lse_grid = normalizers[:count].view(roles, views, frames, pixels, heads)
+        bounds = plan.cross_view_temporal_window.bounds
+        epsilon = DECOMPOSED_TEMPORAL_WINDOW_EPS
+        seeds = tuple(10009 * self.layer_index + 101 * view + role for view in range(views) for role in range(roles))
+        for frame in range(frames):
+            allowed = [
+                i
+                for i in range(frames)
+                if (
+                    i == frame
+                    if bounds is None
+                    else bounds[0] - epsilon <= (i - frame) * plan.seconds_per_frame[0] <= bounds[1] + epsilon
+                )
+            ]
+            if plan.cross_view_temporal_window.includes_first_frame and 0 not in allowed:
+                allowed.insert(0, 0)
+            if not allowed:
+                raise ValueError("BCA requires a cross-view time window containing camera frames")
+            source_k, source_v = [
+                x[:, :, allowed].permute(1, 0, 2, 3, 4, 5).reshape(views, -1, kv_heads, dim)
+                for x in (pooled_k, pooled_v)
+            ]
+            summary_k, source_lse = attention_with_lse(register_q, source_k, source_k)
+            summary_v, _ = attention_with_lse(register_q, source_k, source_v)
+            weights = source_lse[None].masked_fill(~neighbors[:, :, None, None], -torch.inf).softmax(1)
+            weights = weights.to(key.dtype)
+            shared_k = torch.einsum("vsrh,srhd->vrhd", weights, summary_k)
+            shared_v = torch.einsum("vsrh,srhd->vrhd", weights, summary_v)
+            if not self.training and self.inference_ratio:
+                source_k, source_v = [
+                    x[:, :, allowed].permute(1, 0, 2, 3, 4, 5).reshape(views * roles, -1, kv_heads, dim) for x in (k, v)
+                ]
+                indices = batched_importance_indices(
+                    source_v, (len(allowed), height, width), self.inference_ratio, seeds
+                )
+
+                def select(tensor):
+                    selected = tensor.transpose(1, 2).gather(2, indices[..., None].expand(-1, -1, -1, dim))
+                    selected = selected.transpose(1, 2).reshape(views, -1, kv_heads, dim)
+                    return selected[others].reshape(views, -1, kv_heads, dim)
+
+                shared_k = torch.cat((shared_k, select(source_k)), dim=1)
+                shared_v = torch.cat((shared_v, select(source_v)), dim=1)
+            # A single attention launch covers all views AND both target/control roles.
+            frame_q = q[:, :, frame].permute(1, 0, 2, 3, 4).reshape(views, roles * pixels, heads, dim)
+            shared_out, shared_lse = attention_with_lse(frame_q, shared_k, shared_v)
+            out, lse = indexed_attention_with_shared(
+                frame_q, key[:count], value[:count], route, valid, roles, frame * pixels, shared_out, shared_lse
+            )
+            output_grid[:, :, frame] = out.reshape(views, roles, pixels, heads, dim).transpose(0, 1)
+            lse_grid[:, :, frame] = lse.reshape(views, roles, pixels, heads).transpose(0, 1)
         output, normalizers = output.unsqueeze(0), normalizers.unsqueeze(0)
         if torch.is_grad_enabled():
             return DifferentiablePartitionBridge.apply(output, normalizers)

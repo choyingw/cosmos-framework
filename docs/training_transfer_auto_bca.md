@@ -58,10 +58,59 @@ and feature gathers, preserving their relative loss weights across GPU counts.
 This is an adaptation to Cosmos 3's native attention layout: same-view attention
 stays dense and cross-view visibility keeps its **preceding 0.4-second window**.
 It does not change the native teacher into Bosch's unrestricted full-4D teacher.
-The new cross-view operator is a differentiable, chunked PyTorch implementation;
-Bosch's fused sparse CUDA kernels are not ported, and a latency improvement has
-not been established. The same step profiler measures the entire cross-view
-operation, including geometry lookup, compression and selection.
+CUDA FP16/BF16 now uses a fused implementation adapted from Bosch's indexed
+attention and reusable source-summary strategy:
+
+- Pool each source frame once and reuse it across overlapping time windows.
+- Batch all camera views and both query roles for FlashAttention register and
+  shared-bank attention; keep grouped-query heads without expanding K/V heads.
+- Load local K/V directly from calibrated indices in Triton, with four queries
+  per block for the 32-token budget. Inference fuses the local/shared LSE merge.
+- Batch residual importance scoring in Triton, caching only fixed random
+  representatives and geometry routes. Input-dependent scores, selected tokens,
+  K/V, and learned summaries are recomputed every forward.
+- Preserve output **and LSE gradients** through FlashAttention and indexed
+  attention, including native partition merges and activation checkpointing.
+
+The parameter names and shapes are unchanged; existing exports work without
+retraining or re-exporting. The ordinary training/inference commands select this
+path automatically. `COSMOS_BCA_BACKEND=reference` restores the previous chunked
+PyTorch implementation for diagnosis. CPU/unsupported dtypes also use that
+reference path. The CUDA path uses PyTorch's built-in FlashAttention operator
+and Triton; it does not require installing Bosch's package.
+
+The same step profiler measures the entire cross-view operation, including
+geometry lookup, compression and selection, and still writes only rank 0 CSV.
+The first call may include Triton compilation and static-cache construction.
+
+### Isolated operator measurements
+
+Measured on an RTX 3090, PyTorch 2.8.0+cu128 / Triton 3.4.0, BF16, seven views,
+both control/target roles, 32 query / 8 K/V heads, head dimension 128, local/global
+budgets 32/512. Each number is one measured call after one untimed warmup.
+Inference uses 16×15×26 tokens per view/role, corresponding to 61 frames at
+832×480 with temporal compression 4 and spatial compression/patchification 32.
+Training uses **two latent frames** to fit the reference's retained activations.
+
+| Operator workload | Reference CUDA time | Fused CUDA time | Reference extra peak allocation | Fused extra peak allocation |
+| --- | ---: | ---: | ---: | ---: |
+| Inference, 16 latent frames, 35% residuals | 3899 ms | 281 ms | 1513 MiB | 1403 MiB |
+| Training forward + backward, 2 latent frames, no residuals | 531 ms | 67 ms | 12705 MiB | 1584 MiB |
+
+These are BCA-block measurements, **not complete diffusion-step or generation
+speedups**. Allocations exclude live inputs/parameters and warmed static caches;
+they include the operator's outputs and temporaries. Inference sampled-output
+relative L2 difference was 0.00315, consistent with BF16 reduction differences.
+They are not bitwise-identical implementations. Training uses FP32 atomic
+accumulation for local K/V gradients, so backward is not bitwise deterministic.
+
+To reproduce a single measured comparison without loading model weights or
+generating videos (CSV to stdout, rank 0 only):
+
+```bash
+python -m cosmos_framework.scripts.benchmark_bca
+python -m cosmos_framework.scripts.benchmark_bca --mode training
+```
 
 The bundled reference calibration is copied from `Bosch_GenWM/calibration.json`.
 Its match to the default daytime sample is **assumed at the user's instruction**.
@@ -155,7 +204,11 @@ geometry routes, temporal visibility, importance selection, config round trips,
 and ten optimizer updates through the actual teacher–student helper on a tiny
 network with checkpointing off, full, and selective. Feature-only gradients also
 match the uncheckpointed reference. The frozen teacher remains unchanged while LoRA/register parameters
-update. A native training-config dry run resolves the ten-iteration launch.
+update with both the reference and batched implementations. A native training-config
+dry run resolves the ten-iteration launch. CUDA regression tests compare fused
+outputs and Q/K/V/register gradients against the reference, including FP16/BF16,
+grouped-query attention, LSE-only gradients, empty routes, sequence padding,
+importance selection, future-frame exclusion, and full/selective checkpointing.
 Full-size GPU training, checkpoint export/readback and generation require the
 model assets and training GPUs; these have not been executed locally.
 
