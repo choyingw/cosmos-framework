@@ -26,6 +26,44 @@ from cosmos_framework.utils.generator.rand_state import get_rand_state_dict, pad
 pytestmark = [pytest.mark.level(0), pytest.mark.gpus(0)]
 
 
+def test_save_worker_keeps_original_error_and_does_not_publish_failed_checkpoint(tmp_path, monkeypatch):
+    from cosmos_framework.checkpoint import dcp_compat_test
+
+    handler = object.__new__(checkpoint.DistributedCheckpointer)
+    handler.save_to_object_store = False
+    handler._local_dirname = str(tmp_path)
+    handler._write_latest_checkpoint_file = MagicMock()
+
+    def fail_write(*args, **kwargs):
+        raise OSError(28, "injected disk full", str(tmp_path / "model/__0_0.distcp"))
+
+    monkeypatch.setattr(checkpoint.FileSystemWriter, "write_data", fail_write)
+    monkeypatch.setattr(dcp_compat_test.dcp_utils, "_wrap_exception", dcp_compat_test._old_wrap_exception)
+    state = {"model": ({"net.weight": torch.ones(2)}, str(tmp_path / "model"))}
+    with pytest.raises(CheckpointException, match="injected disk full") as caught:
+        handler.save_state_dict_worker(state, "iter_000000010")
+    assert next(iter(caught.value.failures.values()))[0].errno == 28
+    handler._write_latest_checkpoint_file.assert_not_called()
+
+
+def test_save_worker_writes_all_components_before_publishing_checkpoint(tmp_path):
+    handler = object.__new__(checkpoint.DistributedCheckpointer)
+    handler.save_to_object_store = False
+    handler._local_dirname = str(tmp_path)
+    handler._write_latest_checkpoint_file = MagicMock()
+    state = {
+        "model": ({"net.weight": torch.arange(3)}, str(tmp_path / "model")),
+        "trainer": ({"iteration": 10}, str(tmp_path / "trainer")),
+    }
+    handler.save_state_dict_worker(state, "iter_000000010")
+    for component in state:
+        assert (tmp_path / component / ".metadata").is_file()
+    handler._write_latest_checkpoint_file.assert_called_once_with("iter_000000010")
+    restored = {"net.weight": torch.zeros(3, dtype=torch.long)}
+    dcp.load(restored, checkpoint_id=tmp_path / "model", no_dist=True)
+    torch.testing.assert_close(restored["net.weight"], state["model"][0]["net.weight"])
+
+
 def test_staging_bytes_count_local_allocations_and_page_rounding() -> None:
     tensor = torch.empty(1025, dtype=torch.float32)  # [1025]
     view = tensor[::2]  # [513]

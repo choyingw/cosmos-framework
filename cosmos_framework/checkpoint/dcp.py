@@ -80,11 +80,12 @@ from cosmos_framework.checkpoint.background_store import (
     reserve_background_store_socket,
 )
 from cosmos_framework.checkpoint.base import AbstractCheckpointer, CheckpointLoadSource
-from cosmos_framework.checkpoint.safe_dcp import SafeFileSystemReader, SafeLoadPlanner
+from cosmos_framework.checkpoint.dcp_compat import portable_dcp_tracebacks
 from cosmos_framework.checkpoint.s3_filesystem import S3StorageReader, S3StorageWriter
-from cosmos_framework.utils.config import CheckpointConfig, JobConfig
+from cosmos_framework.checkpoint.safe_dcp import SafeFileSystemReader, SafeLoadPlanner
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback, distributed, log, misc
+from cosmos_framework.utils.config import CheckpointConfig, JobConfig
 from cosmos_framework.utils.easy_io import easy_io
 from cosmos_framework.utils.generator.rand_state import get_rand_state_dict, set_rand_state_dict
 from cosmos_framework.utils.safe_unpickle import safe_loads
@@ -1275,11 +1276,19 @@ class DistributedCheckpointer(AbstractCheckpointer):
                     enable_plan_caching=True,
                     cache_plans_key=f"custom_planner_{key}",
                 )
-                dcp.save(
-                    v,
-                    storage_writer=storage_writer,
-                    planner=save_planner,
-                )
+                try:
+                    with portable_dcp_tracebacks():
+                        dcp.save(
+                            v,
+                            storage_writer=storage_writer,
+                            planner=save_planner,
+                        )
+                except BaseException:
+                    log.error(
+                        f"Checkpoint component '{key}' failed to save at '{full_checkpoint_path}'",
+                        rank0_only=False,
+                    )
+                    raise
 
         if distributed.is_rank0():
             log.info(f"Saving last checkpoint file {checkpoint_file}")

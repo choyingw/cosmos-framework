@@ -155,3 +155,29 @@ match the uncheckpointed reference. The frozen teacher remains unchanged while L
 update. A native training-config dry run resolves the ten-iteration launch.
 Full-size GPU training, checkpoint export/readback and generation require the
 model assets and training GPUs; these have not been executed locally.
+
+## Save error: cannot pickle code objects
+
+On older PyTorch with Python 3.13, DCP can fail to serialize the traceback of an
+earlier checkpoint-write error. This hides the actual exception behind
+`TypeError: cannot pickle code objects` during `gather_object`. See
+[PyTorch issue 174669](https://github.com/pytorch/pytorch/issues/174669).
+The Framework save worker now scopes the upstream traceback cleanup to each
+DCP save, retaining the original exception and reporting the failing component
+and destination on every affected rank. Checkpoint contents are unchanged;
+failed saves do not publish `latest_checkpoint.txt`.
+
+That compatibility fix exposes the original write error; it does not establish
+why writing failed. Before repeating training, check free space and inodes on the
+actual output filesystem:
+
+```bash
+df -h /workspace
+df -i /workspace
+du -sh "$BCA_RUN/training/cosmos3/transfer_auto/bca_dummy/checkpoints"
+```
+
+The checkpoint includes the full base model and student EMA even though only
+LoRA/register parameters train. A failed save may leave partial shard files.
+Use the original exception to identify the cause before deciding what to retry
+or remove; an incomplete iteration directory is not a resumable checkpoint.
