@@ -22,6 +22,9 @@ def indexed_forward(
     LSE,
     BASE,
     BASE_LSE,
+    FRAME_IDS,
+    VIEWS: tl.constexpr,
+    MULTI_FRAME: tl.constexpr,
     N: tl.constexpr,
     PIXELS: tl.constexpr,
     ROLES: tl.constexpr,
@@ -39,10 +42,15 @@ def indexed_forward(
     rows = tl.program_id(0) * BQ + tl.arange(0, BQ)
     head = tl.program_id(1)
     slots, dims = tl.arange(0, BL), tl.arange(0, BD)
-    route_rows = (rows // (ROLES * PIXELS) * PIXELS + rows % PIXELS) * L
+    route_rows = (rows // (ROLES * PIXELS) % VIEWS * PIXELS + rows % PIXELS) * L
     route_mask = (rows[:, None] < N) & (slots[None, :] < L)
     valid = tl.load(VALID + route_rows[:, None] + slots[None, :], route_mask, 0).to(tl.int1)
-    source = tl.load(ROUTE + route_rows[:, None] + slots[None, :], route_mask, 0) + OFFSET
+    source = tl.load(ROUTE + route_rows[:, None] + slots[None, :], route_mask, 0)
+    if MULTI_FRAME:
+        frame = tl.load(FRAME_IDS + rows // (VIEWS * ROLES * PIXELS), rows < N, 0)
+        source += frame[:, None] * PIXELS
+    else:
+        source += OFFSET
     qoffset = (rows[:, None] * HQ + head) * D + dims[None, :]
     qmask = (rows[:, None] < N) & (dims[None, :] < D)
     q = tl.load(Q + qoffset, qmask, 0).to(tl.float32)
@@ -208,3 +216,93 @@ def residual_scores(
     score = tl.sum((value - ref) * (value - ref), 1)
     score = tl.where(tokens == representative, float("inf"), score)
     tl.store(SCORES + bh * N + tokens, score, tokens < N)
+
+
+@triton.jit
+def window_residual_scores(
+    V,
+    REP,
+    CELL,
+    ALLOWED,
+    SCORES,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    NC: tl.constexpr,
+    FRAMES: tl.constexpr,
+    PIXELS: tl.constexpr,
+    VIEWS: tl.constexpr,
+    ROLES: tl.constexpr,
+    BD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    tokens = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    bh = tl.program_id(1)
+    batch, head = bh // H, bh % H
+    window, view, role = batch // (VIEWS * ROLES), batch // ROLES % VIEWS, batch % ROLES
+    source_head = (view * ROLES + role) * H + head
+    dims = tl.arange(0, BD)
+    cell = tl.load(CELL + tokens, tokens < N, 0)
+    representative = tl.load(REP + source_head * NC + cell)
+    frame = tl.load(ALLOWED + window * (N // PIXELS) + tokens // PIXELS, tokens < N, 0)
+    reference_frame = tl.load(ALLOWED + window * (N // PIXELS) + representative // PIXELS, tokens < N, 0)
+    row = ((role * VIEWS + view) * FRAMES + frame) * PIXELS + tokens % PIXELS
+    reference_row = ((role * VIEWS + view) * FRAMES + reference_frame) * PIXELS + representative % PIXELS
+    offset = (row[:, None] * H + head) * D + dims[None, :]
+    reference_offset = (reference_row[:, None] * H + head) * D + dims[None, :]
+    mask = (tokens[:, None] < N) & (dims[None, :] < D)
+    value = tl.load(V + offset, mask, 0).to(tl.float32)
+    reference = tl.load(V + reference_offset, mask, 0).to(tl.float32)
+    score = tl.sum((value - reference) * (value - reference), 1)
+    score = tl.where(tokens == representative, float("inf"), score)
+    tl.store(SCORES + bh * N + tokens, score, tokens < N)
+
+
+@triton.jit
+def pack_window_kv(
+    K,
+    V,
+    RK,
+    RV,
+    INDICES,
+    ALLOWED,
+    OTHERS,
+    OK,
+    OV,
+    COUNT: tl.constexpr,
+    N_ALLOWED: tl.constexpr,
+    VIEWS: tl.constexpr,
+    FRAMES: tl.constexpr,
+    PIXELS: tl.constexpr,
+    ROLES: tl.constexpr,
+    KEEP: tl.constexpr,
+    REGISTERS: tl.constexpr,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = i < COUNT
+    dim, head = i % DIM, i // DIM % HEADS
+    length = REGISTERS + (VIEWS - 1) * ROLES * KEEP
+    token, batch = i // (DIM * HEADS) % length, i // (DIM * HEADS * length)
+    window, view = batch // VIEWS, batch % VIEWS
+    register = valid & (token < REGISTERS)
+    register_offset = ((batch * REGISTERS + token) * HEADS + head) * DIM + dim
+    key = tl.load(RK + register_offset, register, 0)
+    value = tl.load(RV + register_offset, register, 0)
+    if KEEP > 0:
+        residual = valid & (token >= REGISTERS)
+        position = token - REGISTERS
+        other = tl.load(OTHERS + view * (VIEWS - 1) + position // (ROLES * KEEP), residual, 0)
+        role, retained = position // KEEP % ROLES, position % KEEP
+        selected = tl.load(
+            INDICES + (((window * VIEWS + other) * ROLES + role) * HEADS + head) * KEEP + retained, residual, 0
+        )
+        frame = tl.load(ALLOWED + window * N_ALLOWED + selected // PIXELS, residual, 0)
+        row = ((role * VIEWS + other) * FRAMES + frame) * PIXELS + selected % PIXELS
+        offset = (row * HEADS + head) * DIM + dim
+        key = tl.where(residual, tl.load(K + offset, residual, 0), key)
+        value = tl.where(residual, tl.load(V + offset, residual, 0), value)
+    tl.store(OK + i, key, valid)
+    tl.store(OV + i, value, valid)

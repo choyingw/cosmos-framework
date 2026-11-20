@@ -32,19 +32,22 @@ The implementation follows sections 3.2–3.5 and 4.3 of the supplied
 | Trainable student parameters | Generation Q/K/V/O and MLP rank-16 LoRA, alpha 16; learned register queries |
 | Frozen teacher | Dense edge weights shared with the student; LoRA and BCA disabled during teacher forward |
 | BCA blocks | Zero-based blocks 10–20 inclusive; other blocks retain native dense cross-view attention |
-| Local bank | At most 32 same-frame tokens across neighboring cameras and control/target source roles |
+| Cross-view eligibility | Native target RGB tokens only; RGB controls remain available through same-view attention |
+| Local bank | At most 32 same-frame target RGB tokens across neighboring cameras |
 | Local geometry | 8 log-spaced depths, 1–120 m; 128 inverse-depth-weighted candidates per source before deduplication/capping |
 | Global bank | 512 learned summaries, spatial average pooling kernel/stride 8; neighboring cameras |
 | Training residual bank | Off |
-| Inference residual bank | 35% of eligible tokens per other source camera, head and control/target role |
+| Inference residual bank | 35% of eligible target RGB tokens per other source camera and K/V head |
 | Residual importance | Protected random representative per 2×2×2 cell, then largest squared V-feature differences; same indices for K/V; no merging |
 | Loss | Native flow matching + prediction MSE + 0.5 × spatially pooled block-feature MSE |
 | Optimizer | Existing native AdamW, learning rate 1e-5; base weights frozen |
 
 Cosmos 3 has shared generation experts rather than a separate control branch.
-BCA therefore processes both control and target tokens in those shared blocks.
-The local budget remains **32 total**, split between source roles. Local, global,
-residual, same-view and caption partitions use a **joint softmax normalizer**.
+Its native camera cross-view partition excludes RGB controls as both queries
+and keys. New BCA training uses **the same eligibility as the dense teacher**;
+controls still participate in the unchanged same-view attention. The local
+budget remains **32 total**, over target RGB sources. Local, global, residual,
+same-view and caption partitions use a **joint softmax normalizer**.
 Feature loss supervises target-camera features, pooled spatially by 4 without
 pooling time. Teacher and student see identical sampled noise, timestep and
 conditioning at every update.
@@ -62,28 +65,55 @@ CUDA FP16/BF16 now uses a fused implementation adapted from Bosch's indexed
 attention and reusable source-summary strategy:
 
 - Pool each source frame once and reuse it across overlapping time windows.
-- Batch all camera views and both query roles for FlashAttention register and
-  shared-bank attention; keep grouped-query heads without expanding K/V heads.
+- Batch camera views and time windows of equal length for register/shared-bank
+  attention. Bound packed K/V workspace to 512 MiB per group, adapting the time
+  batch size to the number of K/V heads on the context-parallel rank.
+- Select installed FlashAttention-3 on Hopper, preferring Framework's
+  `flash_attn_3_nv` package, then Bosch's `flash_attn_3` package. Ampere/Ada use
+  PyTorch FlashAttention. The tested training backward retains the ATen path.
+- Keep grouped-query heads without expanding K/V heads. Cache device-side camera
+  and time indices to avoid repeated CPU-to-GPU transfers/synchronization.
 - Load local K/V directly from calibrated indices in Triton, with four queries
   per block for the 32-token budget. Inference fuses the local/shared LSE merge.
-- Batch residual importance scoring in Triton, caching only fixed random
-  representatives and geometry routes. Input-dependent scores, selected tokens,
-  K/V, and learned summaries are recomputed every forward.
+- Score residual importance directly from original V storage, then pack selected
+  K/V and registers in one Triton kernel. Avoid materializing source windows,
+  separate gathered K/V, expanded neighbor banks and concatenation intermediates.
+- Cache only fixed random representatives and geometry/index plans. Input-dependent
+  scores, selected tokens, K/V and learned summaries are recomputed every forward.
 - Preserve output **and LSE gradients** through FlashAttention and indexed
   attention, including native partition merges and activation checkpointing.
 
-The parameter names and shapes are unchanged; existing exports work without
-retraining or re-exporting. The ordinary training/inference commands select this
-path automatically. `COSMOS_BCA_BACKEND=reference` restores the previous chunked
-PyTorch implementation for diagnosis. CPU/unsupported dtypes also use that
-reference path. The CUDA path uses PyTorch's built-in FlashAttention operator
-and Triton; it does not require installing Bosch's package.
+The kernel changes preserve parameter names/shapes. `COSMOS_BCA_BACKEND=reference`
+selects the chunked PyTorch implementation for numerical diagnosis;
+CPU/unsupported dtypes also use it. On H200 use `COSMOS_BCA_FLASH_BACKEND=flash3`
+to require FA3 and fail clearly if its package cannot load. `auto` (the default)
+warns and falls back to ATen if Hopper FA3 is unavailable; `aten` forces the
+PyTorch backend for comparisons. No Bosch package is required.
+
+**The mask correction requires a fresh student training run.** The new recipe
+sets and exports `bca_native_cross_view=true`. Older exports lacking that field
+preserve their earlier expanded control/target cross-view graph. For an explicit
+old-checkpoint diagnostic only, `COSMOS_BCA_NATIVE_CROSS_VIEW=1` selects the
+corrected graph; it changes model behavior and is not a substitute for training.
+Set `0` to reproduce the legacy graph. The teacher remains dense and frozen.
+
+The earlier graph doubled both cross-view queries and source tokens by including
+controls. Consequently 35% retention represented approximately **1.4×** the
+native dense teacher's cross-view query–key pairs, before the 32 local and 512
+register tokens. Token retention alone was therefore not a valid compute
+comparison. This is separate from the earlier kernel inefficiencies.
+
+Bosch also folds uniform residual/register banks into its same-view attention
+call. Cosmos3's cross-view bank changes with the query frame's preceding 0.4-second
+window, while same-view attention can see all of its own frames. Simply combining
+these into one camera-wide bank would change visibility. This implementation
+batches equal-length time windows and retains the exact native same-view policy.
 
 The same step profiler measures the entire cross-view operation, including
 geometry lookup, compression and selection, and still writes only rank 0 CSV.
 The first call may include Triton compilation and static-cache construction.
 
-### Isolated operator measurements
+### Earlier operator measurements (legacy mask)
 
 Measured on an RTX 3090, PyTorch 2.8.0+cu128 / Triton 3.4.0, BF16, seven views,
 both control/target roles, 32 query / 8 K/V heads, head dimension 128, local/global
@@ -104,8 +134,31 @@ relative L2 difference was 0.00315, consistent with BF16 reduction differences.
 They are not bitwise-identical implementations. Training uses FP32 atomic
 accumulation for local K/V gradients, so backward is not bitwise deterministic.
 
-To reproduce a single measured comparison without loading model weights or
-generating videos (CSV to stdout, rank 0 only):
+For the earlier implementation/mask comparison, add
+`--legacy-control-cross-view` to the reference benchmark. The default benchmark
+now uses native target-only eligibility.
+
+### Corrected dense-baseline comparison
+
+A local RTX 3090 diagnostic with 16×15×26 tokens per view, 7 views and
+**4 query / 1 K/V heads** (the per-rank CP=8 head shape) measured **19.46 ms**
+for the original dense cross-view partition dispatch and **14.49 ms** for corrected
+BCA, one measured call after warmup. Native planning, gathers, view-tree
+partitions and scatter were retained; because that test environment lacks the
+external FA/NATTEN wheels, its dense varlen call used ATen FlashAttention, as did
+BCA. These are cross-view-region measurements, excluding common same-view,
+caption and final merge work. They are **not H200 or full-generation results**.
+
+The benchmark's `dense` comparison uses the actual native dispatcher/library in
+the installed Framework environment. On the H200 instance, reproduce it without
+loading model weights or generating videos (CSV stdout, rank 0 only):
+
+```bash
+COSMOS_BCA_FLASH_BACKEND=flash3 python -m cosmos_framework.scripts.benchmark_bca \
+  --comparison dense --query-heads 4 --kv-heads 1
+```
+
+Reference implementation and training checks:
 
 ```bash
 python -m cosmos_framework.scripts.benchmark_bca
@@ -127,10 +180,22 @@ Run in the existing Framework environment on the training machine. Set `EDGE_HF`
 to the successful dense edge export from the preceding experiment. Use a new
 output directory for each dummy run.
 
+For the requested H200 rerun, the checked-in launcher performs fresh 10-step
+training, export, and exactly one profiled inference. It uses the repository's
+`.venv/bin/python`, rejects an existing run directory, and requires Hopper FA3:
+
+```bash
+export EDGE_HF=/path/to/your/dense_edge_hf
+BCA_NATIVE_RUN=/workspace/cosmos_data/bca_native_run01 bash tools/run_bca_native_dummy.sh
+```
+
+`BCA_GPUS` defaults to 8; `BCA_PYTHON` can override the interpreter. The launcher
+does not resume the earlier student. Individual commands follow.
+
 ```bash
 cd /workspace/cosmos-framework
 source .venv/bin/activate
-export BCA_RUN=/workspace/cosmos_data/bca_dummy_run01
+export BCA_RUN=/workspace/cosmos_data/bca_native_run01
 
 python -m cosmos_framework.scripts.prepare_transfer_auto_edge_sample \
   --train-dummy --bca --steps 10 \
@@ -175,7 +240,7 @@ BCA architecture; no separate adapter merge is required for Framework inference.
 ## One inference with the existing profile
 
 ```bash
-python -m cosmos_framework.scripts.run_transfer_auto \
+COSMOS_BCA_FLASH_BACKEND=flash3 python -m cosmos_framework.scripts.run_transfer_auto \
   --checkpoint "$BCA_HF" \
   --control-type edge --mode camera \
   --frames 61 --resolution 480 --seed 0 \
@@ -208,7 +273,11 @@ update with both the reference and batched implementations. A native training-co
 dry run resolves the ten-iteration launch. CUDA regression tests compare fused
 outputs and Q/K/V/register gradients against the reference, including FP16/BF16,
 grouped-query attention, LSE-only gradients, empty routes, sequence padding,
-importance selection, future-frame exclusion, and full/selective checkpointing.
+importance selection, future-frame exclusion, grouped temporal windows,
+native control exclusion, and full/selective checkpointing. A warmed inference
+operator also passes CUDA graph capture, detecting accidental blocking host
+transfers/synchronization. FA3 dispatch is unit-tested with both supported package
+interfaces; actual H200 FA3 execution remains to be validated on that instance.
 Full-size GPU training, checkpoint export/readback and generation require the
 model assets and training GPUs; these have not been executed locally.
 

@@ -57,6 +57,8 @@ def test_no_cross_view_ignores_other_camera_but_retains_own_temporal_control_and
         raise AssertionError("A cross-view kernel was launched")
 
     monkeypatch.setattr(dense, "_aligned_cross_view_attention", forbidden)
+    # A loaded BCA module must not resurrect cross-view work in the ablation.
+    monkeypatch.setattr("cosmos_framework.model.generator.mot.bca.active_bca", lambda: forbidden)
     plan = dense.build_multiview_maskless_plan(
         [2, 2],
         [(4, 1, 1), (4, 1, 1)],

@@ -2008,7 +2008,7 @@ def multiview_maskless_gen_attention(
     with attention_region("cross_view", enabled=not plan.cross_view_empty):
         cross_view_outs: list[torch.Tensor] = []
         cross_view_lses: list[torch.Tensor] = []
-        if bca_operator is not None:
+        if bca_operator is not None and not plan.cross_view_empty:
             cross_view_out, cross_view_lse = bca_operator(q, k, v, plan)
             cross_view_outs.append(cross_view_out)
             cross_view_lses.append(cross_view_lse)

@@ -12,6 +12,7 @@ def make_transfer_auto_bca_experiment():
     config.job.name = "bca_dummy"
     config.model.config.update(
         bca_enabled=True,
+        bca_native_cross_view=True,
         bca_distillation=True,
         bca_calibration_json="${oc.env:COSMOS_BCA_CALIBRATION_JSON}",
         bca_camera_keys=list(MADS_AML_ALT_RIG),

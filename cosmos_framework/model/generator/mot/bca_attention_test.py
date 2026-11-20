@@ -29,8 +29,9 @@ pytestmark = [
 def _close(actual, expected, *, atol=0.025):
     torch.testing.assert_close(actual.float(), expected.float(), atol=atol, rtol=0.03)
     # Also constrain aggregate error; absolute tolerances alone hide weak gradients.
-    delta = (actual.float() - expected.float()).norm()
-    assert delta <= 0.025 * expected.float().norm() + 1e-5
+    finite = expected.isfinite()
+    delta = (actual.float()[finite] - expected.float()[finite]).norm()
+    assert delta <= 0.025 * expected.float()[finite].norm() + 1e-5
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -204,3 +205,97 @@ def test_route_cache_from_inference_mode_is_safe_for_later_training():
     output, _ = operator.train()(*tensors, plan)
     output.square().mean().backward()
     assert all(t.grad is not None and torch.isfinite(t.grad).all() for t in tensors)
+
+
+@pytest.mark.parametrize("first_frame", [True, False])
+@pytest.mark.parametrize("native_visibility", [True, False])
+@torch.no_grad()
+def test_batched_time_windows_match_reference_and_keep_original_values(first_frame, native_visibility):
+    from cosmos_framework.model.generator.mot.bca import _window_batches
+
+    torch.manual_seed(73)
+    operator, plan = _operator_and_plan(2)
+    operator.eval()
+    operator.native_cross_view = native_visibility
+    plan.is_control = (True, False)
+    frames = 7
+    plan.token_shapes = ((2 * frames, 3, 4),) * 2
+    plan.num_gen_tokens = 2 * 2 * frames * 12
+    plan.cross_view_temporal_window.includes_first_frame = first_frame
+    tensors = [torch.randn(plan.num_gen_tokens, h, 32, device="cuda", dtype=torch.bfloat16) for h in (4, 2, 2)]
+    batches = _window_batches(2, frames, 4 / 30, (-0.4, 0.0), first_frame, tensors[0].device, 12, 2, 2, 32, 16, 0.35)[2]
+    assert any(frame_ids.numel() > 1 for frame_ids, _ in batches)
+    actual, lse = operator(*tensors, plan)
+    expected, expected_lse = (
+        operator._native_forward(operator.forward_reference, *tensors, plan)
+        if native_visibility
+        else operator.forward_reference(*tensors, plan)
+    )
+    _close(actual, expected)
+    _close(lse, expected_lse)
+    # The final frame cannot change ANY earlier outputs, even in a grouped batch.
+    changed = tensors[2].reshape(2, 2, frames, 12, 2, 32).clone()
+    changed[:, :, -1] += 100
+    result, _ = operator(tensors[0], tensors[1], changed.reshape_as(tensors[2]), plan)
+    before_last = torch.arange(plan.num_gen_tokens, device="cuda").view(2, 2, frames, 12)[:, :, :-1].flatten()
+    torch.testing.assert_close(result[:, before_last], actual[:, before_last], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_native_visibility_cuda_gradients_survive_outer_merge(checkpointed):
+    torch.manual_seed(97)
+    operator, plan = _operator_and_plan(2)
+    plan.is_control = (True, False)
+    operator.native_cross_view = True
+    tensors = [
+        torch.randn(plan.num_gen_tokens + 3, h, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for h in (4, 2, 2)
+    ]
+    other = torch.randn_like(tensors[0])[None]
+    other_lse = torch.randn(other.shape[:-1], device="cuda")
+
+    def forward(reference, *inputs):
+        if reference:
+            out, lse = operator._native_forward(operator.forward_reference, *inputs, plan)
+        else:
+            out, lse = operator(*inputs, plan)
+        assert out[:, : plan.num_gen_tokens // 2].count_nonzero() == 0
+        assert lse[:, : plan.num_gen_tokens // 2].isneginf().all()
+        return merge_attentions_ac_safe([other.clone(), out], [other_lse.clone(), lse])[0]
+
+    if checkpointed:
+        actual = checkpoint(lambda *x: forward(False, *x), *tensors, use_reentrant=False)
+    else:
+        actual = forward(False, *tensors)
+    expected = forward(True, *tensors)
+    _close(actual, expected)
+    dout = torch.randn_like(actual)
+    parameters = (*tensors, operator.bca_register_queries)
+    grads = torch.autograd.grad(actual, parameters, dout, retain_graph=True)
+    references = torch.autograd.grad(expected, parameters, dout)
+    for observed, reference in zip(grads, references, strict=True):
+        _close(observed, reference, atol=0.06)
+    assert operator.last_plan is plan
+
+
+@torch.no_grad()
+def test_warmed_native_inference_has_no_host_sync_or_cpu_index_transfers():
+    operator, plan = _operator_and_plan(2)
+    operator.eval()
+    operator.native_cross_view = True
+    plan.is_control = (True, False)
+    tensors = [torch.randn(plan.num_gen_tokens, h, 32, device="cuda", dtype=torch.bfloat16) for h in (4, 2, 2)]
+    # Graph capture rejects blocking CPU/GPU transfers and stream synchronizations.
+    # This tests the operator, without enabling CUDA graphs in the model profiler.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            expected = operator(*tensors, plan)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = operator(*tensors, plan)
+    graph.replay()
+    for observed, reference in zip(result, expected, strict=True):
+        torch.testing.assert_close(observed, reference)

@@ -8,11 +8,73 @@ Internal FlashAttention LSEs need their own VJP: silently detaching them gives
 incorrect register and local/shared partition training gradients.
 """
 
+import importlib
+import inspect
+import os
+from functools import lru_cache
+
 import torch
 
 
 def fused_supported(tensor):
     return tensor.is_cuda and tensor.dtype in (torch.float16, torch.bfloat16) and tensor.shape[-1] <= 256
+
+
+@lru_cache(maxsize=8)
+def _inference_flash_backend(device, preference):
+    """Use the installed Hopper backend, as Bosch does; never hide execution errors."""
+    if preference not in ("auto", "aten", "flash3"):
+        raise ValueError("COSMOS_BCA_FLASH_BACKEND must be auto, aten or flash3")
+    if preference == "aten":
+        return "aten", None, False
+    hopper = torch.cuda.get_device_capability(device)[0] == 9
+    if not hopper:
+        if preference == "flash3":
+            raise RuntimeError("BCA FlashAttention-3 requires a Hopper GPU (e.g. H100/H200)")
+        return "aten", None, False
+    failures = []
+    for package in ("flash_attn_3_nv.flash_attn_interface", "flash_attn_3.flash_attn_interface"):
+        try:
+            module = importlib.import_module(package)
+        except (ImportError, OSError) as exc:
+            failures.append(f"{package}: {exc}")
+            continue
+        function = module.flash_attn_func
+        return package, function, "return_attn_probs" in inspect.signature(function).parameters
+    reason = "BCA could not load Hopper FlashAttention-3: " + "; ".join(failures)
+    if preference == "flash3":
+        raise RuntimeError(reason)
+    import warnings
+
+    warnings.warn(
+        reason + ". Falling back to PyTorch FlashAttention; set COSMOS_BCA_FLASH_BACKEND=flash3 to require FA3.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return "aten", None, False
+
+
+def inference_attention_with_lse(query, key, value):
+    _, function, return_probs = _inference_flash_backend(
+        query.device, os.environ.get("COSMOS_BCA_FLASH_BACKEND", "auto")
+    )
+    if function is not None:
+        kwargs = {"return_attn_probs": True} if return_probs else {}
+        out, lse = function(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            softmax_scale=query.shape[-1] ** -0.5,
+            causal=False,
+            **kwargs,
+        )[:2]
+        return out, lse.transpose(1, 2)
+    # FlashAttention accepts these transposed VIEWS. Making them head-major
+    # contiguous copied every Q/K/V bank in the previous implementation.
+    result = torch.ops.aten._scaled_dot_product_flash_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2), 0.0, False, False
+    )
+    return result[0].transpose(1, 2), result[1].transpose(1, 2)
 
 
 class _FlashWithLSE(torch.autograd.Function):
@@ -76,6 +138,8 @@ class _FlashWithLSE(torch.autograd.Function):
 def attention_with_lse(query, key, value):
     """[batch,sequence,heads,dim], with GQA and no score matrix on CUDA."""
     if fused_supported(query):
+        if not torch.is_grad_enabled():
+            return inference_attention_with_lse(query, key, value)
         return _FlashWithLSE.apply(query, key, value)
     groups = query.shape[2] // key.shape[2]
     k, v = [x.repeat_interleave(groups, dim=2) for x in (key, value)]
@@ -83,7 +147,7 @@ def attention_with_lse(query, key, value):
     return torch.einsum("bqhk,bkhd->bqhd", scores.softmax(-1).to(query.dtype), v), scores.logsumexp(-1)
 
 
-def _indexed_forward(query, key, value, routes, valid, roles, offset, base=None, base_lse=None):
+def _indexed_forward(query, key, value, routes, valid, roles, offset, base=None, base_lse=None, frame_ids=None):
     from cosmos_framework.model.generator.mot.bca_kernels import indexed_forward
 
     views, queries, heads, dim = query.shape
@@ -103,6 +167,9 @@ def _indexed_forward(query, key, value, routes, valid, roles, offset, base=None,
             lse,
             query if base is None else base.contiguous(),
             lse if base_lse is None else base_lse.contiguous(),
+            routes if frame_ids is None else frame_ids,
+            routes.shape[0],
+            frame_ids is not None,
             views * queries,
             pixels,
             roles,

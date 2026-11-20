@@ -229,12 +229,21 @@ def test_native_maskless_dispatch_replaces_only_cross_view_partition(monkeypatch
 
 @pytest.mark.parametrize("checkpoint_mode", ["none", "full", "selective"])
 @pytest.mark.parametrize("backend", ["reference", "optimized"])
+@pytest.mark.parametrize("native_visibility", [False, True])
 def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registers(
-    checkpoint_mode, backend, monkeypatch
+    checkpoint_mode, backend, native_visibility, monkeypatch
 ):
     """Exercise the actual distillation helper/merge backward on a tiny CPU network."""
     monkeypatch.setattr("cosmos_framework.model.generator.mot.activation_marks._MARKING_ENABLED", False)
-    monkeypatch.setattr(BudgetCrossView, "forward", getattr(BudgetCrossView, f"forward_{backend}"))
+    method = getattr(BudgetCrossView, f"forward_{backend}")
+
+    def selected_forward(self, query, key, value, plan):
+        bound_method = method.__get__(self, BudgetCrossView)
+        if native_visibility:
+            return self._native_forward(bound_method, query, key, value, plan)
+        return bound_method(query, key, value, plan)
+
+    monkeypatch.setattr(BudgetCrossView, "forward", selected_forward)
 
     class Block(torch.nn.Module):
         def __init__(self):
@@ -362,3 +371,29 @@ def test_captured_feature_loss_gradients_match_without_checkpointing(checkpoint_
     expected.square().mean().backward()
     torch.testing.assert_close(block.projection.weight.grad, reference.projection.weight.grad)
     torch.testing.assert_close(block.projection.bias.grad, reference.projection.bias.grad)
+
+
+@pytest.mark.parametrize("target_first", [True, False])
+def test_native_visibility_excludes_all_control_cross_view_dependencies(target_first):
+    cfg = config()
+    cfg.bca_native_cross_view = True
+    operator = BudgetCrossView(4, cfg, 10).eval()
+    camera_plan = plan()
+    camera_plan.is_control = (not target_first, target_first)
+    target = slice(0, 48) if target_first else slice(48, 96)
+    control = slice(48, 96) if target_first else slice(0, 48)
+    tensors = [torch.randn(96, 2, 4, requires_grad=True) for _ in range(3)]
+    actual, lse = operator(*tensors, camera_plan)
+    assert operator.last_plan is camera_plan
+    assert actual[:, control].count_nonzero() == 0
+    assert lse[:, control].isneginf().all()
+    with torch.no_grad():
+        changed = [x.clone() for x in tensors]
+        for x in changed:
+            x[control] += 100
+        result, _ = operator(*changed, camera_plan)
+        torch.testing.assert_close(result[:, target], actual[:, target], rtol=0, atol=0)
+    actual.square().mean().backward()
+    for x in tensors:
+        assert x.grad[control].count_nonzero() == 0
+        assert x.grad[target].abs().sum() > 0

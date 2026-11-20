@@ -26,7 +26,18 @@ from cosmos_framework.model.generator.mot.bca import BudgetCrossView
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("inference", "training"), default="inference")
+    parser.add_argument(
+        "--comparison",
+        choices=("reference", "dense"),
+        default="reference",
+        help="dense uses the original native 100%% cross-view partition dispatch",
+    )
     parser.add_argument("--latent-frames", type=int)
+    parser.add_argument(
+        "--legacy-control-cross-view",
+        action="store_true",
+        help="Reproduce older BCA exports that added cross-view control Q/K/V",
+    )
     parser.add_argument("--height", type=int, default=15)
     parser.add_argument("--width", type=int, default=26)
     parser.add_argument("--query-heads", type=int, default=32)
@@ -36,6 +47,8 @@ def main():
     if int(os.environ.get("RANK", "0")) != 0:
         return
     training = args.mode == "training"
+    if training and args.comparison == "dense":
+        parser.error("The native dense partition comparison is inference-only")
     frames = args.latent_frames if args.latent_frames is not None else (2 if training else 16)
     if min(frames, args.height, args.width, args.query_heads, args.kv_heads, args.head_dim) < 1:
         parser.error("All dimensions must be positive")
@@ -51,6 +64,7 @@ def main():
     config = SimpleNamespace(
         bca_calibration_json=json.dumps(calibration),
         bca_camera_keys=list(calibration["cameras"]),
+        bca_native_cross_view=not args.legacy_control_cross_view,
         bca_local_budget=32,
         bca_global_budget=512,
         bca_global_pool=8,
@@ -67,6 +81,7 @@ def main():
         num_views=(views,) * roles,
         view_axis=(0,) * roles,
         items_per_sample=(roles,),
+        is_control=(True, False),
         num_gen_tokens=count,
         seconds_per_frame=(4 / 30,) * roles,
         cross_view_temporal_window=SimpleNamespace(bounds=(-0.4, 0.0), includes_first_frame=False),
@@ -76,19 +91,60 @@ def main():
         torch.randn(count, heads, args.head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=training)
         for heads in (args.query_heads, args.kv_heads, args.kv_heads)
     ]
+    dense_forward = None
+    if args.comparison == "dense":
+        from cosmos_framework.configs.base.defaults.multiview_attention import CrossViewTemporalWindowConfig
+        from cosmos_framework.model.generator.mot import multiview_maskless_attention as native
+
+        native_plan = native.build_multiview_maskless_plan(
+            plan.num_views,
+            plan.token_shapes,
+            device=tensors[0].device,
+            items_per_sample=(roles,),
+            is_control=(True, False),
+            control_attends_sensor=True,
+            seconds_per_frame=plan.seconds_per_frame,
+            padded_gen_tokens=count,
+            cross_view_temporal_window=CrossViewTemporalWindowConfig(bounds=(-0.4, 0.0)),
+        )
+        passes = native.cross_view_passes(native_plan)
+
+        def dense_forward(q, k, v, ignored_plan):
+            # Exactly the native cross_view profiler region: packing, varlen
+            # attention and scatter; the outer same/caption/partition merge is excluded.
+            return [native._aligned_cross_view_attention(q, k, v, part, count) for part in passes]
+
     writer = csv.writer(sys.stdout)
     writer.writerow(
-        ("backend", "mode", "latent_frames", "height", "width", "wall_ms", "cuda_elapsed_ms", "peak_extra_mib")
+        (
+            "backend",
+            "mode",
+            "native_cross_view",
+            "latent_frames",
+            "height",
+            "width",
+            "wall_ms",
+            "cuda_elapsed_ms",
+            "peak_extra_mib",
+        )
     )
-    for backend in ("reference", "optimized"):
-        forward = getattr(operator, f"forward_{backend}")
+    for backend in (args.comparison, "optimized"):
+        method = getattr(operator, f"forward_{backend}") if backend != "dense" else None
+        if backend == "dense":
+            forward = dense_forward
+        elif operator.native_cross_view:
+
+            def forward(q, k, v, plan):
+                return operator._native_forward(method, q, k, v, plan)
+        else:
+            forward = method
 
         def run():
             with torch.set_grad_enabled(training):
-                output, lse = forward(*tensors, plan)
+                result = forward(*tensors, plan)
                 if training:
-                    return torch.autograd.grad(output.square().mean(), (*tensors, operator.bca_register_queries))
-                return output, lse
+                    return torch.autograd.grad(result[0].square().mean(), (*tensors, operator.bca_register_queries))
+                return result
 
         warmup = run()
         torch.cuda.synchronize()
@@ -108,6 +164,7 @@ def main():
             (
                 backend,
                 args.mode,
+                operator.native_cross_view,
                 frames,
                 args.height,
                 args.width,

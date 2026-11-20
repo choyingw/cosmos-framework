@@ -14,6 +14,7 @@ import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
+from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -171,6 +172,127 @@ def _device_routes(calibration, cameras, height, width, budget, depths, minimum,
     return indices.to(device), valid.to(device)
 
 
+@lru_cache(maxsize=16)
+@torch.inference_mode(False)
+def _source_plan(views, frames, seconds_per_frame, bounds, includes_first_frame, device):
+    """Cache CPU-derived camera/time indices on device, avoiding per-frame H2D syncs."""
+    neighbors = [
+        [
+            source in (PHYSICAL_NEIGHBORS[target] if views == 7 else tuple(i for i in range(views) if i != target))
+            for source in range(views)
+        ]
+        for target in range(views)
+    ]
+    others = [[source for source in range(views) if source != target] for target in range(views)]
+    windows = []
+    epsilon = DECOMPOSED_TEMPORAL_WINDOW_EPS
+    for frame in range(frames):
+        allowed = [
+            i
+            for i in range(frames)
+            if (
+                i == frame
+                if bounds is None
+                else bounds[0] - epsilon <= (i - frame) * seconds_per_frame <= bounds[1] + epsilon
+            )
+        ]
+        if includes_first_frame and 0 not in allowed:
+            allowed.insert(0, 0)
+        if not allowed:
+            raise ValueError("BCA requires a cross-view time window containing camera frames")
+        windows.append(torch.tensor(allowed, device=device, dtype=torch.long))
+    return torch.tensor(neighbors, device=device), torch.tensor(others, device=device), tuple(windows)
+
+
+@lru_cache(maxsize=16)
+@torch.inference_mode(False)
+def _window_batches(views, frames, seconds, bounds, first, device, pixels, roles, kv_heads, dim, registers, ratio):
+    neighbors, others, windows = _source_plan(views, frames, seconds, bounds, first, device)
+    by_length = {}
+    for frame, window in enumerate(windows):
+        by_length.setdefault(window.numel(), []).append(frame)
+    batches = []
+    for length, frame_numbers in by_length.items():
+        keep = math.ceil(length * pixels * ratio)
+        # Bound the TWO packed K/V banks together to 512 MiB. CP8 batches more
+        # frames than CP1, where each rank owns eight times as many K/V heads.
+        per_frame = views * (registers + (views - 1) * roles * keep) * kv_heads * dim * 2 * 2
+        chunk = max(1, (512 * 1024**2) // max(1, per_frame))
+        for start in range(0, len(frame_numbers), chunk):
+            group = frame_numbers[start : start + chunk]
+            batches.append((torch.tensor(group, device=device), torch.stack([windows[f] for f in group])))
+    return neighbors, others, tuple(batches)
+
+
+def window_importance_indices(value, shape, frames, views, roles, allowed, ratio, seeds):
+    """Score original strided source values without gathering overlapping time windows."""
+    from cosmos_framework.model.generator.mot.bca_kernels import window_residual_scores
+
+    count, heads, dim = math.prod(shape), value.shape[-2], value.shape[-1]
+    batch, keep = (allowed.numel() // shape[0]) * views * roles, math.ceil(math.prod(shape) * ratio)
+    if keep in (0, count):
+        return torch.arange(keep, device=value.device).expand(batch, heads, -1).contiguous()
+    cells, representatives = _representatives(shape, heads, tuple(seeds), value.device)
+    if keep < representatives.shape[-1]:
+        raise ValueError("Residual retention is below the protected 2x2x2 representative-cell floor")
+    scores = torch.empty((batch, heads, count), device=value.device, dtype=torch.float32)
+    with torch.cuda.device(value.device):
+        window_residual_scores[((count + 31) // 32, batch * heads)](
+            value,
+            representatives,
+            cells,
+            allowed,
+            scores,
+            count,
+            heads,
+            dim,
+            representatives.shape[-1],
+            frames,
+            shape[1] * shape[2],
+            views,
+            roles,
+            1 << (dim - 1).bit_length(),
+            32,
+        )
+    return scores.topk(keep, dim=-1).indices.sort(dim=-1).values
+
+
+def pack_window_bank(key, value, registers_k, registers_v, indices, allowed, others, frames, pixels, roles):
+    """One K/V packing kernel, directly from original K/V + per-head retained indices."""
+    from cosmos_framework.model.generator.mot.bca_kernels import pack_window_kv
+
+    batch, registers, heads, dim = registers_k.shape
+    views = others.shape[0]
+    keep = indices.shape[-1]
+    length = registers + (views - 1) * roles * keep
+    packed_k = torch.empty((batch, length, heads, dim), device=key.device, dtype=key.dtype)
+    packed_v = torch.empty_like(packed_k)
+    with torch.cuda.device(key.device):
+        pack_window_kv[((packed_k.numel() + 1023) // 1024,)](
+            key,
+            value,
+            registers_k.contiguous(),
+            registers_v.contiguous(),
+            indices.contiguous(),
+            allowed,
+            others,
+            packed_k,
+            packed_v,
+            packed_k.numel(),
+            allowed.numel() // (batch // views),
+            views,
+            frames,
+            pixels,
+            roles,
+            keep,
+            registers,
+            heads,
+            dim,
+            1024,
+        )
+    return packed_k, packed_v
+
+
 def head_gather(tensor, indices):
     return tensor.permute(1, 0, 2).gather(1, indices.unsqueeze(-1).expand(-1, -1, tensor.shape[-1])).permute(1, 0, 2)
 
@@ -204,6 +326,12 @@ class BudgetCrossView(nn.Module):
     def __init__(self, head_dim: int, config, layer_index: int, *, device=None):
         super().__init__()
         self.head_dim, self.layer_index = head_dim, layer_index
+        visibility = os.environ.get("COSMOS_BCA_NATIVE_CROSS_VIEW")
+        if visibility not in (None, "0", "1"):
+            raise ValueError("COSMOS_BCA_NATIVE_CROSS_VIEW must be 0 or 1")
+        self.native_cross_view = (
+            getattr(config, "bca_native_cross_view", False) if visibility is None else visibility == "1"
+        )
         self.calibration = config.bca_calibration_json
         self.cameras = tuple(config.bca_camera_keys)
         self.local_budget, self.global_budget = config.bca_local_budget, config.bca_global_budget
@@ -267,7 +395,7 @@ class BudgetCrossView(nn.Module):
             scores.float().logsumexp(-1).transpose(1, 2),
         )
 
-    def forward_reference(self, query, key, value, plan):
+    def forward_reference(self, query, key, value, plan, *, bridge=True):
         self.last_plan = plan
         views = len(self.cameras)
         # Explicitly support the seven-camera, aligned control+target experiment.
@@ -379,7 +507,7 @@ class BudgetCrossView(nn.Module):
                         output[offset + start : offset + stop] = out
                         normalizers[offset + start : offset + stop] = lse
         output, normalizers = output.unsqueeze(0), normalizers.unsqueeze(0)
-        if torch.is_grad_enabled():
+        if bridge and torch.is_grad_enabled():
             return DifferentiablePartitionBridge.apply(output, normalizers)
         return output, normalizers
 
@@ -389,11 +517,53 @@ class BudgetCrossView(nn.Module):
         backend = os.environ.get("COSMOS_BCA_BACKEND", "auto")
         if backend not in ("auto", "reference"):
             raise ValueError("COSMOS_BCA_BACKEND must be auto or reference")
-        if backend == "reference" or not fused_supported(query):
-            return self.forward_reference(query, key, value, plan)
-        return self.forward_optimized(query, key, value, plan)
+        method = (
+            self.forward_reference if backend == "reference" or not fused_supported(query) else self.forward_optimized
+        )
+        if not self.native_cross_view:
+            return method(query, key, value, plan)
+        return self._native_forward(method, query, key, value, plan)
 
-    def forward_optimized(self, query, key, value, plan):
+    def _native_forward(self, method, query, key, value, plan):
+        """Match the dense camera teacher: RGB controls have no cross-view Q/K/V edges.
+
+        Preserve same-view control conditioning in the native dispatcher, and put
+        ONE differentiable merge bridge around the final packed partition. An
+        inner bridge before scatter would not see the native merge's storage patch.
+        """
+        if len(plan.items_per_sample) != 1 or len(set(plan.token_shapes)) != 1:
+            raise ValueError("Native BCA requires one synchronized fixed-grid camera sample")
+        targets = [i for i, control in enumerate(plan.is_control) if not control]
+        if len(targets) != 1 or len(plan.is_control) != len(plan.token_shapes):
+            raise ValueError("Native BCA requires exactly one target camera item plus optional RGB controls")
+        target = targets[0]
+        count = math.prod(plan.token_shapes[target])
+        start, stop = target * count, (target + 1) * count
+        target_plan = SimpleNamespace(
+            token_shapes=(plan.token_shapes[target],),
+            num_views=(plan.num_views[target],),
+            view_axis=(plan.view_axis[target],),
+            items_per_sample=(1,),
+            is_control=(False,),
+            num_gen_tokens=count,
+            padded_gen_tokens=count,
+            seconds_per_frame=(plan.seconds_per_frame[target],),
+            cross_view_temporal_window=plan.cross_view_temporal_window,
+        )
+        try:
+            out, lse = method(query[start:stop], key[start:stop], value[start:stop], target_plan, bridge=False)
+        finally:
+            # Teacher/student feature pooling needs the ORIGINAL packed layout.
+            self.last_plan = plan
+        packed_out = torch.zeros_like(query).unsqueeze(0)
+        packed_lse = query.new_full((1, *query.shape[:2]), -torch.inf, dtype=torch.float32)
+        packed_out[:, start:stop] = out
+        packed_lse[:, start:stop] = lse
+        if torch.is_grad_enabled():
+            return DifferentiablePartitionBridge.apply(packed_out, packed_lse)
+        return packed_out, packed_lse
+
+    def forward_optimized(self, query, key, value, plan, *, bridge=True):
         from cosmos_framework.model.generator.mot.bca_attention import (
             attention_with_lse,
             indexed_attention_with_shared,
@@ -416,6 +586,8 @@ class BudgetCrossView(nn.Module):
         count, heads, kv_heads, dim = roles * total_frames * pixels, query.shape[1], key.shape[1], self.head_dim
         if count != plan.num_gen_tokens or heads % kv_heads:
             raise ValueError("BCA packed grid or grouped query heads are inconsistent")
+        if not self.training and not torch.is_grad_enabled() and query.is_cuda:
+            return self._forward_inference(query, key, value, plan, frames, height, width, roles)
         q = query[:count].reshape(roles, views, frames, pixels, heads, dim)
         k = key[:count].reshape(roles, views, frames, pixels, kv_heads, dim)
         v = value[:count].reshape_as(k)
@@ -440,37 +612,25 @@ class BudgetCrossView(nn.Module):
         )
         pooled_k = pooled_k.reshape(roles, views, frames, -1, kv_heads, dim)
         pooled_v = pooled_v.reshape_as(pooled_k)
-        neighbors = torch.zeros((views, views), dtype=torch.bool, device=query.device)
-        for view in range(views):
-            neighbors[
-                view, list(PHYSICAL_NEIGHBORS[view] if views == 7 else tuple(i for i in range(views) if i != view))
-            ] = True
-        others = torch.tensor([[i for i in range(views) if i != view] for view in range(views)], device=query.device)
+        bounds = plan.cross_view_temporal_window.bounds
+        neighbors, others, windows = _source_plan(
+            views,
+            frames,
+            plan.seconds_per_frame[0],
+            None if bounds is None else tuple(bounds),
+            plan.cross_view_temporal_window.includes_first_frame,
+            query.device,
+        )
         register_q = self.bca_register_queries.to(key.dtype).expand(-1, kv_heads, -1)
         register_q = register_q[None].expand(views, -1, -1, -1)
         output = torch.zeros_like(query)
         normalizers = query.new_full(query.shape[:2], -torch.inf, dtype=torch.float32)
         output_grid = output[:count].view(roles, views, frames, pixels, heads, dim)
         lse_grid = normalizers[:count].view(roles, views, frames, pixels, heads)
-        bounds = plan.cross_view_temporal_window.bounds
-        epsilon = DECOMPOSED_TEMPORAL_WINDOW_EPS
         seeds = tuple(10009 * self.layer_index + 101 * view + role for view in range(views) for role in range(roles))
-        for frame in range(frames):
-            allowed = [
-                i
-                for i in range(frames)
-                if (
-                    i == frame
-                    if bounds is None
-                    else bounds[0] - epsilon <= (i - frame) * plan.seconds_per_frame[0] <= bounds[1] + epsilon
-                )
-            ]
-            if plan.cross_view_temporal_window.includes_first_frame and 0 not in allowed:
-                allowed.insert(0, 0)
-            if not allowed:
-                raise ValueError("BCA requires a cross-view time window containing camera frames")
+        for frame, allowed in enumerate(windows):
             source_k, source_v = [
-                x[:, :, allowed].permute(1, 0, 2, 3, 4, 5).reshape(views, -1, kv_heads, dim)
+                x.index_select(2, allowed).permute(1, 0, 2, 3, 4, 5).reshape(views, -1, kv_heads, dim)
                 for x in (pooled_k, pooled_v)
             ]
             summary_k, source_lse = attention_with_lse(register_q, source_k, source_k)
@@ -481,7 +641,8 @@ class BudgetCrossView(nn.Module):
             shared_v = torch.einsum("vsrh,srhd->vrhd", weights, summary_v)
             if not self.training and self.inference_ratio:
                 source_k, source_v = [
-                    x[:, :, allowed].permute(1, 0, 2, 3, 4, 5).reshape(views * roles, -1, kv_heads, dim) for x in (k, v)
+                    x.index_select(2, allowed).permute(1, 0, 2, 3, 4, 5).reshape(views * roles, -1, kv_heads, dim)
+                    for x in (k, v)
                 ]
                 indices = batched_importance_indices(
                     source_v, (len(allowed), height, width), self.inference_ratio, seeds
@@ -503,9 +664,99 @@ class BudgetCrossView(nn.Module):
             output_grid[:, :, frame] = out.reshape(views, roles, pixels, heads, dim).transpose(0, 1)
             lse_grid[:, :, frame] = lse.reshape(views, roles, pixels, heads).transpose(0, 1)
         output, normalizers = output.unsqueeze(0), normalizers.unsqueeze(0)
-        if torch.is_grad_enabled():
+        if bridge and torch.is_grad_enabled():
             return DifferentiablePartitionBridge.apply(output, normalizers)
         return output, normalizers
+
+    def _forward_inference(self, query, key, value, plan, frames, height, width, roles):
+        from cosmos_framework.model.generator.mot.bca_attention import _indexed_forward, attention_with_lse
+
+        query, key, value = [x.contiguous() for x in (query, key, value)]
+        views, pixels, dim = len(self.cameras), height * width, self.head_dim
+        heads, kv_heads = query.shape[1], key.shape[1]
+        count = roles * views * frames * pixels
+        q = query[:count].view(roles, views, frames, pixels, heads, dim)
+        k = key[:count].view(roles, views, frames * pixels, kv_heads, dim)
+        v = value[:count].view_as(k)
+        route, valid = _device_routes(
+            self.calibration,
+            self.cameras,
+            height,
+            width,
+            self.local_budget,
+            self.depth_samples,
+            self.depth_min,
+            self.depth_max,
+            frames,
+            roles,
+            query.device,
+        )
+        bounds = plan.cross_view_temporal_window.bounds
+        neighbors, others, batches = _window_batches(
+            views,
+            frames,
+            plan.seconds_per_frame[0],
+            None if bounds is None else tuple(bounds),
+            plan.cross_view_temporal_window.includes_first_frame,
+            query.device,
+            pixels,
+            roles,
+            kv_heads,
+            dim,
+            self.global_budget,
+            self.inference_ratio,
+        )
+        pooled = self._summaries(k, v, (frames, height, width))
+        pooled_k, pooled_v = [x.reshape(roles, views, frames, -1, kv_heads, dim) for x in pooled]
+        registers = self.bca_register_queries.to(key.dtype).expand(-1, kv_heads, -1)
+        seeds = tuple(10009 * self.layer_index + 101 * view + role for view in range(views) for role in range(roles))
+        output = torch.zeros_like(query)
+        normalizers = query.new_full(query.shape[:2], -torch.inf, dtype=torch.float32)
+        output_grid = output[:count].view(roles, views, frames, pixels, heads, dim)
+        lse_grid = normalizers[:count].view(roles, views, frames, pixels, heads)
+        for frame_ids, allowed in batches:
+            group, length = allowed.shape
+            source_k, source_v = [
+                x.index_select(2, allowed.flatten())
+                .reshape(roles, views, group, length, -1, kv_heads, dim)
+                .permute(2, 1, 0, 3, 4, 5, 6)
+                .reshape(group * views, -1, kv_heads, dim)
+                for x in (pooled_k, pooled_v)
+            ]
+            register_q = registers[None].expand(group * views, -1, -1, -1)
+            summary_k, source_lse = attention_with_lse(register_q, source_k, source_k)
+            summary_v, _ = attention_with_lse(register_q, source_k, source_v)
+            source_lse = source_lse.view(group, views, self.global_budget, kv_heads)
+            weights = source_lse[:, None].masked_fill(~neighbors[None, :, :, None, None], -torch.inf).softmax(2)
+            weights = weights.to(key.dtype)
+
+            def combine(summary):
+                return torch.einsum(
+                    "bvsrh,bsrhd->bvrhd", weights, summary.view(group, views, self.global_budget, kv_heads, dim)
+                ).reshape(group * views, self.global_budget, kv_heads, dim)
+
+            shared_k, shared_v = combine(summary_k), combine(summary_v)
+            if self.inference_ratio:
+                indices = window_importance_indices(
+                    value[:count], (length, height, width), frames, views, roles, allowed, self.inference_ratio, seeds
+                )
+                shared_k, shared_v = pack_window_bank(
+                    key[:count], value[:count], shared_k, shared_v, indices, allowed, others, frames, pixels, roles
+                )
+            batch_q = (
+                q.index_select(2, frame_ids)
+                .permute(2, 1, 0, 3, 4, 5)
+                .reshape(group * views, roles * pixels, heads, dim)
+            )
+            shared_out, shared_lse = attention_with_lse(batch_q, shared_k, shared_v)
+            out, lse = _indexed_forward(
+                batch_q, key[:count], value[:count], route, valid, roles, 0, shared_out, shared_lse, frame_ids=frame_ids
+            )
+            output_grid.index_copy_(
+                2, frame_ids, out.view(group, views, roles, pixels, heads, dim).permute(2, 1, 0, 3, 4, 5)
+            )
+            lse_grid.index_copy_(2, frame_ids, lse.view(group, views, roles, pixels, heads).permute(2, 1, 0, 3, 4))
+        return output.unsqueeze(0), normalizers.unsqueeze(0)
 
 
 def install_bca(net, config):
@@ -517,7 +768,7 @@ def install_bca(net, config):
         or config.joint_attn_implementation != "multiview"
         or config.multiview_attention.backend != "maskless"
         or config.multiview_attention.geometry_position_encoding != "baseline"
-        or config.multiview_attention.mask.attention_scope != "decomposed"
+        or config.multiview_attention.mask.attention_scope not in ("decomposed", "same_view")
         or not config.multiview_attention.mask.control_attends_sensor
         or config.attention_io_layout != "sequence_sharded"
     ):

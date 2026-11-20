@@ -294,6 +294,9 @@ class OmniMoTModelConfig:
     lora_enabled: bool = False
     # Paper 5919 BCA: shared GEN pathway, camera-only maskless partition.
     bca_enabled: bool = False
+    # False preserves older BCA exports that trained cross-view control edges.
+    # New recipes enable native target-only cross-view visibility.
+    bca_native_cross_view: bool = False
     bca_calibration_json: str = ""
     bca_camera_keys: list[str] = attrs.field(factory=list)
     bca_start_block: int = 10

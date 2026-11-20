@@ -36,6 +36,7 @@ def test_bca_recipe_matches_paper_and_survives_export_metadata(monkeypatch):
     assert model.bca_prediction_weight == 1.0 and model.bca_feature_weight == 0.5
     assert model.bca_inference_ratio == 0.35
     assert model.correct_cp_gradients
+    assert model.bca_native_cross_view
     assert not config.checkpoint.load_training_state and config.checkpoint.strict_resume
     assert "bca_" in config.checkpoint.keys_to_skip_loading
     plain = OmegaConf.to_container(config.model, resolve=True)
@@ -44,5 +45,6 @@ def test_bca_recipe_matches_paper_and_survives_export_metadata(monkeypatch):
     restored = load_model_config_from_hf_config(json.loads(json.dumps({"model": public})))
     assert restored["config"]["bca_calibration_json"] == calibration
     assert restored["config"]["bca_inference_ratio"] == 0.35
+    assert restored["config"]["bca_native_cross_view"] is True
     command = dummy_training_command(gpus=8, steps=10, bca=True)
     assert "experiment=transfer_auto_bca_61_480" in command and "job.name=bca_dummy" in command
