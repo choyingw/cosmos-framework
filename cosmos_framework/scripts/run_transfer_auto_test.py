@@ -8,9 +8,46 @@ from pathlib import Path
 
 import pytest
 
-from cosmos_framework.scripts.run_transfer_auto import write_window_captions
+from cosmos_framework.data.generator.multiview.rig_catalog import MADS_AML_ALT_RIG
+from cosmos_framework.scripts.run_transfer_auto import align_bca_camera_order, write_window_captions
 
 pytestmark = [pytest.mark.L0, pytest.mark.CPU]
+
+
+def test_bca_alignment_keeps_camera_assets_and_prompts_together():
+    views = [
+        dict(
+            camera_key=key,
+            vision_path=f"{key}/rgb.mp4",
+            control_path=f"{key}/edge.mp4",
+            caption_path=f"{key}/caption.json",
+            prompt=f"Caption for {key}",
+        )
+        for key in reversed(MADS_AML_ALT_RIG)
+    ]
+    original = {view["camera_key"]: view for view in views}
+    request = {"multiview": {"views": views}}
+    metadata = {"model": {"config": {"bca_enabled": True, "bca_camera_keys": list(MADS_AML_ALT_RIG)}}}
+    align_bca_camera_order(request, metadata)
+    assert [view["camera_key"] for view in views] == MADS_AML_ALT_RIG
+    for view in views:
+        assert view is original[view["camera_key"]]
+    align_bca_camera_order(request, metadata)  # Already aligned is unchanged.
+    assert [view["camera_key"] for view in views] == MADS_AML_ALT_RIG
+
+
+@pytest.mark.parametrize("cameras", [MADS_AML_ALT_RIG[:-1], MADS_AML_ALT_RIG + ["unknown"], MADS_AML_ALT_RIG * 2])
+def test_bca_alignment_rejects_missing_extra_or_duplicate_cameras(cameras):
+    request = {"multiview": {"views": [dict(camera_key=key) for key in cameras]}}
+    metadata = {"model": {"config": {"bca_enabled": True, "bca_camera_keys": list(MADS_AML_ALT_RIG)}}}
+    with pytest.raises(ValueError, match="calibrated training rig|unique"):
+        align_bca_camera_order(request, metadata)
+
+
+def test_dense_checkpoint_keeps_original_request_order():
+    request = {"multiview": {"views": [dict(camera_key=key) for key in reversed(MADS_AML_ALT_RIG)]}}
+    align_bca_camera_order(request, {"model": {"config": {"bca_enabled": False}}})
+    assert [view["camera_key"] for view in request["multiview"]["views"]] == list(reversed(MADS_AML_ALT_RIG))
 
 
 def test_frame_window_copies_captions_and_clips_future_timestamps(tmp_path: Path, monkeypatch):

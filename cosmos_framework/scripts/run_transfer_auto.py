@@ -20,6 +20,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def align_bca_camera_order(request: dict, metadata: dict) -> None:
+    """Match packed view order to BCA calibration, retaining complete view records."""
+    config = metadata.get("model", {}).get("config", {})
+    if not config.get("bca_enabled"):
+        return
+    expected = config.get("bca_camera_keys")
+    if (
+        not isinstance(expected, list)
+        or not expected
+        or any(not isinstance(key, str) or not key for key in expected)
+        or len(expected) != len(set(expected))
+    ):
+        raise ValueError("BCA checkpoint must declare distinct nonempty bca_camera_keys")
+    views = request["multiview"]["views"]
+    by_camera = {view["camera_key"]: view for view in views}
+    if len(by_camera) != len(views):
+        raise ValueError("BCA inference camera keys must be unique")
+    if set(by_camera) != set(expected):
+        raise ValueError(
+            "BCA inference cameras differ from the calibrated training rig: "
+            f"missing={sorted(set(expected) - set(by_camera))}, "
+            f"extra={sorted(set(by_camera) - set(expected))}"
+        )
+    # Reorder records, never camera labels alone: paths/prompts must stay paired.
+    views[:] = [by_camera[key] for key in expected]
+
+
 def write_window_captions(request: dict, output: Path):
     """Copy the initial caption interval into this run, leaving downloaded assets intact."""
     from helpers.wsm_helpers import caption_window
@@ -113,6 +140,17 @@ def main():
     for binary in ("ffmpeg", "ffprobe"):
         if not shutil.which(binary):
             parser.error(f"Install {binary} and put it on PATH")
+    checkpoint = args.checkpoint.expanduser().absolute() if args.checkpoint else None
+    metadata = None
+    if checkpoint is not None:
+        if not (checkpoint / "config.json").is_file():
+            raise ValueError(f"Expected a complete model snapshot at {checkpoint}")
+        metadata = json.loads((checkpoint / "config.json").read_text())
+        if args.control_type == "edge" and metadata.get("per_view_caption_task") != "av_multiview_edge_transfer":
+            raise ValueError(
+                "Edge inference needs an adapted export with per_view_caption_task=av_multiview_edge_transfer. "
+                "Export the edge training checkpoint with --per-view-caption-task av_multiview_edge_transfer."
+            )
     os.environ.update(COSMOS_INTERNAL="0", COSMOS_TRAINING="0", TOKENIZERS_PARALLELISM="false")
     sys.path[:0] = [str(auto), str(repo)]
     from helpers.auto_helpers import probe_video, validate_framework_outputs, validate_rgb_conditions
@@ -152,6 +190,8 @@ def main():
 
         if set(keys) != set(MADS_AML_ALT_RIG):
             raise ValueError("The edge adaptation requires all seven MADS_AML_ALT_RIG cameras")
+    if metadata is not None:
+        align_bca_camera_order(request, metadata)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (args.output or repo / "outputs/transfer_auto" / stamp).expanduser().absolute()
     output.mkdir(parents=True, exist_ok=False)
@@ -193,9 +233,7 @@ def main():
     gpus = args.gpus if args.gpus is not None else available
     if not 1 <= gpus <= available:
         raise ValueError(f"Requested {gpus} GPUs; this environment sees {available}")
-    if args.checkpoint:
-        checkpoint = args.checkpoint.expanduser().absolute()
-    else:
+    if checkpoint is None:
         from huggingface_hub import HfApi, snapshot_download
 
         model = "nvidia/Cosmos3-Nano-Transfer-Auto"
@@ -204,16 +242,6 @@ def main():
         checkpoint = Path(snapshot_download(model, revision=revision, ignore_patterns=["assets/**"]))
     if not (checkpoint / "config.json").is_file():
         raise ValueError(f"Expected a complete model snapshot at {checkpoint}")
-    if args.control_type == "edge":
-        metadata = json.loads((checkpoint / "config.json").read_text())
-        if metadata.get("per_view_caption_task") != "av_multiview_edge_transfer":
-            raise ValueError(
-                "Edge inference needs an adapted export with per_view_caption_task=av_multiview_edge_transfer. "
-                "Export the edge training checkpoint with --per-view-caption-task av_multiview_edge_transfer."
-            )
-        bca_config = metadata.get("model", {}).get("config", {})
-        if bca_config.get("bca_enabled") and keys != bca_config["bca_camera_keys"]:
-            raise ValueError("BCA inference camera order must match the calibrated training camera order")
     generated = output / "generated"
     command = [
         sys.executable,

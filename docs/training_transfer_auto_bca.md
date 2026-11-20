@@ -67,7 +67,10 @@ The bundled reference calibration is copied from `Bosch_GenWM/calibration.json`.
 Its match to the default daytime sample is **assumed at the user's instruction**.
 Pass `--bca-calibration /path/to/calibration.json` to replace it. The launcher embeds
 the selected JSON in `train.env` and model config, so an exported model needs no
-external calibration file. The inference wrapper validates the seven-camera order.
+external calibration file. The inference wrapper validates the seven camera
+identities and orders complete view records to match the exported calibration
+before preparing edge maps and captions. Source request order may differ; RGB,
+controls, captions and prompts remain paired with their camera key.
 
 ## Train ten updates
 
