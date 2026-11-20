@@ -34,7 +34,13 @@ def pool_block_features(features, plan, pool, cp_mesh=None, *, correct_cp_gradie
 
 @contextmanager
 def capture_features(net, pool, cp_mesh=None, *, correct_cp_gradients=False):
-    captured, handles = {}, []
+    """Capture outputs without adding autograd ops inside checkpointed blocks.
+
+    Hooks are removed before backward. Pooling/gathering inside a hook would
+    therefore save tensors in the original forward but not its recomputation.
+    Defer those differentiable operations until the model forward has returned.
+    """
+    captured, pending, handles = {}, {}, []
     for module in net.modules():
         attention = getattr(module, "self_attn", None)
         operator = getattr(attention, "bca_attention", None)
@@ -44,9 +50,7 @@ def capture_features(net, pool, cp_mesh=None, *, correct_cp_gradients=False):
         def hook(_module, _inputs, output, operator=operator):
             if operator.last_plan is None:
                 raise RuntimeError("BCA block features were captured without the camera packing plan")
-            captured[operator.layer_index] = pool_block_features(
-                get_gen_seq(output[0]), operator.last_plan, pool, cp_mesh, correct_cp_gradients=correct_cp_gradients
-            )
+            pending[operator.layer_index] = (get_gen_seq(output[0]), operator.last_plan)
 
         handles.append(module.register_forward_hook(hook))
     try:
@@ -54,6 +58,8 @@ def capture_features(net, pool, cp_mesh=None, *, correct_cp_gradients=False):
     finally:
         for handle in handles:
             handle.remove()
+    for index, (features, plan) in pending.items():
+        captured[index] = pool_block_features(features, plan, pool, cp_mesh, correct_cp_gradients=correct_cp_gradients)
 
 
 def teacher_student_forward(model, packed_sequence, memory):

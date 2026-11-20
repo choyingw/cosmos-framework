@@ -18,7 +18,11 @@ from cosmos_framework.model.generator.mot.bca import (
     importance_indices,
     record_plan,
 )
-from cosmos_framework.model.generator.mot.bca_distillation import pool_block_features, teacher_student_forward
+from cosmos_framework.model.generator.mot.bca_distillation import (
+    capture_features,
+    pool_block_features,
+    teacher_student_forward,
+)
 from cosmos_framework.model.generator.mot.bca_geometry import local_routes
 from cosmos_framework.model.generator.mot.merge_attention import merge_attentions_ac_safe
 from cosmos_framework.utils.generator.lora import LoraInjectedLinear
@@ -223,8 +227,10 @@ def test_native_maskless_dispatch_replaces_only_cross_view_partition(monkeypatch
     assert operator.last_plan is camera_plan
 
 
-def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registers():
+@pytest.mark.parametrize("checkpoint_mode", ["none", "full", "selective"])
+def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registers(checkpoint_mode, monkeypatch):
     """Exercise the actual distillation helper/merge backward on a tiny CPU network."""
+    monkeypatch.setattr("cosmos_framework.model.generator.mot.activation_marks._MARKING_ENABLED", False)
 
     class Block(torch.nn.Module):
         def __init__(self):
@@ -258,7 +264,20 @@ def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registe
 
     class Model:
         def __init__(self):
-            self.net = torch.nn.Sequential(Block())
+            block = Block()
+            if checkpoint_mode != "none":
+                from cosmos_framework.configs.base.defaults.activation_checkpointing import (
+                    ActivationCheckpointingConfig,
+                )
+                from cosmos_framework.model.generator.mot.parallelize_unified_mot import (
+                    _apply_full_ac,
+                    _apply_selective_ac,
+                )
+
+                ac = ActivationCheckpointingConfig(mode=checkpoint_mode, save_only_marked_ops=True)
+                wrap = _apply_full_ac if checkpoint_mode == "full" else _apply_selective_ac
+                block = wrap(block, ac)
+            self.net = torch.nn.Sequential(block)
             self.config = SimpleNamespace(bca_feature_pool=2)
             self.parallel_dims = SimpleNamespace(cp_enabled=False)
 
@@ -290,12 +309,52 @@ def test_ten_teacher_student_updates_preserve_teacher_and_train_lora_and_registe
         for name, parameter in model.net.named_parameters():
             if not parameter.requires_grad:
                 torch.testing.assert_close(parameter, original[name], rtol=0, atol=0)
-        registers = "0.self_attn.bca_attention.bca_register_queries"
+        registers = next(name for name in original if name.endswith("bca_register_queries"))
         assert not torch.equal(dict(model.net.named_parameters())[registers], original[registers])
-        assert not torch.equal(model.net[0].projections[3].lora_B.weight, original["0.projections.3.lora_B.weight"])
+        projection = next(name for name in original if name.endswith("projections.3.lora_B.weight"))
+        assert not torch.equal(model.net[0].projections[3].lora_B.weight, original[projection])
         with torch.no_grad(), dense_teacher():
             teacher_after = model.denoise(data_batch_packed=packed, memory=noisy_inputs)["preds_vision"][1]
         torch.testing.assert_close(teacher_after, teacher_before, rtol=0, atol=0)
         assert model.net.training
     finally:
         torch.set_num_threads(previous_threads)
+
+
+@pytest.mark.parametrize("checkpoint_mode", ["full", "selective"])
+def test_captured_feature_loss_gradients_match_without_checkpointing(checkpoint_mode, monkeypatch):
+    """Feature-only backward must survive hook removal and retain the same gradients."""
+    from copy import deepcopy
+
+    from cosmos_framework.configs.base.defaults.activation_checkpointing import ActivationCheckpointingConfig
+    from cosmos_framework.model.generator.mot.parallelize_unified_mot import _apply_full_ac, _apply_selective_ac
+
+    monkeypatch.setattr("cosmos_framework.model.generator.mot.activation_marks._MARKING_ENABLED", False)
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = torch.nn.Module()
+            self.self_attn.bca_attention = SimpleNamespace(last_plan=plan(), layer_index=10)
+            self.projection = torch.nn.Linear(8, 8)
+
+        def forward(self, inputs):
+            return {"full_only_seq": self.projection(inputs).tanh()}, None, None
+
+    torch.manual_seed(23)
+    reference = Block()
+    block = deepcopy(reference)
+    wrap = _apply_full_ac if checkpoint_mode == "full" else _apply_selective_ac
+    net = wrap(block, ActivationCheckpointingConfig(mode=checkpoint_mode, save_only_marked_ops=True))
+    inputs = torch.randn(96, 8)
+    expected = pool_block_features(reference(inputs)[0]["full_only_seq"], plan(), 2)
+    with capture_features(net, 2) as captured:
+        net(inputs)
+    actual = captured[10]
+    torch.testing.assert_close(actual, expected)
+    # No active hooks remain when activation checkpointing recomputes forward.
+    assert all(not module._forward_hooks for module in net.modules())
+    actual.square().mean().backward()
+    expected.square().mean().backward()
+    torch.testing.assert_close(block.projection.weight.grad, reference.projection.weight.grad)
+    torch.testing.assert_close(block.projection.bias.grad, reference.projection.bias.grad)

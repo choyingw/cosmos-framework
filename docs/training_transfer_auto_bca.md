@@ -48,6 +48,10 @@ residual, same-view and caption partitions use a **joint softmax normalizer**.
 Feature loss supervises target-camera features, pooled spatially by 4 without
 pooling time. Teacher and student see identical sampled noise, timestep and
 conditioning at every update.
+Feature hooks retain output references only; spatial pooling and CP gathering run
+after the forward returns, outside activation-checkpointed blocks. This preserves
+feature gradients while keeping forward/recomputation tensor counts identical
+after the temporary hooks are removed before backward.
 The fresh student run enables native CP gradient correction for both prediction
 and feature gathers, preserving their relative loss weights across GPU counts.
 
@@ -146,7 +150,8 @@ dispatch and CUDA times and call counts. No trace or JSON timing report is enabl
 CPU tests exercise the native maskless dispatch, joint-softmax backward, bounded
 geometry routes, temporal visibility, importance selection, config round trips,
 and ten optimizer updates through the actual teacher–student helper on a tiny
-network. The frozen teacher remains unchanged while LoRA/register parameters
+network with checkpointing off, full, and selective. Feature-only gradients also
+match the uncheckpointed reference. The frozen teacher remains unchanged while LoRA/register parameters
 update. A native training-config dry run resolves the ten-iteration launch.
 Full-size GPU training, checkpoint export/readback and generation require the
 model assets and training GPUs; these have not been executed locally.
